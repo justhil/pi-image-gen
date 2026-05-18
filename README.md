@@ -182,9 +182,9 @@ image_review
 
 用途：模型生成前端概念图、页面参照图或素材图后，主动调用 `image_review`，用 TUI 审查面板把图片直接渲染到终端给用户确认。支持本地路径、HTTP/HTTPS URL、`data:image/...` 和裸 base64；URL 会先下载为 base64 再渲染。
 
-终端图片优先使用 pi / pi-tui 的 inline image 能力：Kitty、Ghostty、WezTerm 走 Kitty graphics protocol，iTerm2 走 iTerm2 image protocol。PowerShell、cmd、zsh 是 shell，不是图片协议；在 Windows Terminal / 普通 xterm 这类未向 pi 暴露 Kitty/iTerm2 的终端里，插件会先尝试调用系统默认图片查看器打开保存后的图片，并对 PNG 自动降级为 ANSI 色块预览，同时显示图片文件路径。
+终端图片优先使用 pi / pi-tui 的 inline image 能力：Kitty、Ghostty、WezTerm 走 Kitty graphics protocol，iTerm2 走 iTerm2 image protocol。PowerShell、cmd、zsh 是 shell，不是图片协议；在 Windows Terminal / 普通 xterm 这类未向 pi 暴露 Kitty/iTerm2 的终端里，插件会尝试调用系统默认图片查看器打开保存后的图片，同时显示图片文件路径。
 
-审查面板参考已安装的 `pi-ace-tool` 配置选择器交互：使用上下键选择、Enter 确认、Esc 取消；需要反馈时在同一个面板内显示输入框。
+审查面板参考 `pi-ask-user`：搜索式单选、宽屏分栏详情预览、可进入自定义反馈编辑器；使用上下键选择、输入文字过滤、Enter 确认、Esc 返回或取消。
 
 默认选项：
 
@@ -195,7 +195,7 @@ image_review
 取消
 ```
 
-`需要修改` / `重做/拒绝` 会进入反馈输入框，Enter 提交，Esc 返回选项。
+`需要修改` / `重做/拒绝` 会进入反馈编辑器，Enter 提交，Esc 返回选项；也可以选择 `输入自定义反馈` 直接给出完整反馈。
 
 关闭方式：
 
