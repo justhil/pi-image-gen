@@ -87,6 +87,7 @@ interface ImageResult {
 interface EditImageInput {
 	blob: Blob;
 	filename: string;
+	dataUrl: string;
 }
 
 interface ImageGenToolDetails extends ImageResult {
@@ -942,7 +943,7 @@ async function chooseModelFlow(ctx: ExtensionCommandContext, config: ImageGenCon
 }
 
 async function fetchModels(config: ResolvedConfig): Promise<string[]> {
-	const response = await fetch(`${config.baseUrl}/v1/models`, {
+	const response = await fetch(apiUrl(config.baseUrl, "/v1/models"), {
 		headers: { Authorization: `Bearer ${config.apiKey}` },
 	});
 	const text = await response.text();
@@ -1005,21 +1006,41 @@ async function requestImage(ctx: { cwd: string }, options: ImageRequestOptions, 
 	validateConfig(config);
 
 	let response: Response;
+	let text: string;
 	if (options.action === "edit") {
 		if (!options.image) throw new Error("图生图需要 image 输入");
 		const image = await normalizeEditImageInput(options.image, ctx.cwd);
+		const editPayload = {
+			model: options.model || config.model,
+			prompt: options.prompt,
+			size: options.size || config.size,
+			response_format: options.responseFormat || config.responseFormat,
+		};
 		const form = new FormData();
-		form.append("model", options.model || config.model);
-		form.append("prompt", options.prompt);
-		form.append("size", options.size || config.size);
-		form.append("response_format", options.responseFormat || config.responseFormat);
+		form.append("model", editPayload.model);
+		form.append("prompt", editPayload.prompt);
+		form.append("size", editPayload.size);
+		form.append("response_format", editPayload.response_format);
 		form.append("image", image.blob, image.filename);
-		response = await fetch(`${config.baseUrl}${IMAGE2_EDIT_PATH}`, {
+		response = await fetch(apiUrl(config.baseUrl, IMAGE2_EDIT_PATH), {
 			method: "POST",
 			headers: { Authorization: `Bearer ${config.apiKey}` },
 			body: form,
 			signal,
 		});
+		text = await response.text();
+		if (!response.ok && shouldRetryEditAsJson(response.status, text) && !signal?.aborted) {
+			response = await fetch(apiUrl(config.baseUrl, IMAGE2_EDIT_PATH), {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${config.apiKey}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ ...editPayload, image: image.dataUrl, images: [image.dataUrl] }),
+				signal,
+			});
+			text = await response.text();
+		}
 	} else {
 		const body: Record<string, unknown> = {
 			model: options.model || config.model,
@@ -1027,7 +1048,7 @@ async function requestImage(ctx: { cwd: string }, options: ImageRequestOptions, 
 			size: options.size || config.size,
 			response_format: options.responseFormat || config.responseFormat,
 		};
-		response = await fetch(`${config.baseUrl}${IMAGE2_GENERATE_PATH}`, {
+		response = await fetch(apiUrl(config.baseUrl, IMAGE2_GENERATE_PATH), {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${config.apiKey}`,
@@ -1036,9 +1057,9 @@ async function requestImage(ctx: { cwd: string }, options: ImageRequestOptions, 
 			body: JSON.stringify(body),
 			signal,
 		});
+		text = await response.text();
 	}
 
-	const text = await response.text();
 	if (!response.ok) {
 		throw new Error(`Image2 HTTP ${response.status}: ${text.slice(0, 800)}`);
 	}
@@ -1084,7 +1105,7 @@ async function testConnection(ctx: ExtensionCommandContext): Promise<void> {
 	try {
 		const config = await resolveConfig();
 		validateConfig(config);
-		const response = await fetch(`${config.baseUrl}/v1/models`, {
+		const response = await fetch(apiUrl(config.baseUrl, "/v1/models"), {
 			headers: { Authorization: `Bearer ${config.apiKey}` },
 		});
 		if (!response.ok) {
@@ -1168,6 +1189,12 @@ function maskSecret(value: string | undefined): string {
 	return `${value.slice(0, 4)}${"*".repeat(Math.max(4, value.length - 8))}${value.slice(-4)}`;
 }
 
+function shouldRetryEditAsJson(status: number, text: string): boolean {
+	if (status !== 400 && status !== 415 && status !== 422) return false;
+	const lower = text.toLowerCase();
+	return lower.includes("prompt") || lower.includes("content-type") || lower.includes("json") || lower.includes("field required");
+}
+
 async function normalizeEditImageInput(input: string, cwd: string): Promise<EditImageInput> {
 	const trimmed = input.trim();
 	if (/^https?:\/\//i.test(trimmed)) {
@@ -1175,22 +1202,28 @@ async function normalizeEditImageInput(input: string, cwd: string): Promise<Edit
 		if (!response.ok) throw new Error(`图片下载失败：HTTP ${response.status}`);
 		const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
 		const mimeType = contentType?.startsWith("image/") ? contentType : mimeFromPath(new URL(trimmed).pathname);
+		const buffer = Buffer.from(await response.arrayBuffer());
 		return {
-			blob: new Blob([await response.arrayBuffer()], { type: mimeType }),
+			blob: new Blob([buffer], { type: mimeType }),
 			filename: basename(new URL(trimmed).pathname) || `input.${extensionFromMime(mimeType)}`,
+			dataUrl: `data:${mimeType};base64,${buffer.toString("base64")}`,
 		};
 	}
 	if (trimmed.startsWith("data:image/")) {
 		const parsed = parseDataUrl(trimmed);
+		const buffer = Buffer.from(parsed.data, "base64");
 		return {
-			blob: new Blob([Buffer.from(parsed.data, "base64")], { type: parsed.mimeType }),
+			blob: new Blob([buffer], { type: parsed.mimeType }),
 			filename: `input.${extensionFromMime(parsed.mimeType)}`,
+			dataUrl: `data:${parsed.mimeType};base64,${buffer.toString("base64")}`,
 		};
 	}
 	if (looksLikeBase64(trimmed)) {
+		const buffer = Buffer.from(trimmed, "base64");
 		return {
-			blob: new Blob([Buffer.from(trimmed, "base64")], { type: "image/png" }),
+			blob: new Blob([buffer], { type: "image/png" }),
 			filename: "input.png",
+			dataUrl: `data:image/png;base64,${buffer.toString("base64")}`,
 		};
 	}
 
@@ -1200,6 +1233,7 @@ async function normalizeEditImageInput(input: string, cwd: string): Promise<Edit
 	return {
 		blob: new Blob([data], { type: mimeType }),
 		filename: basename(file) || `input.${extensionFromMime(mimeType)}`,
+		dataUrl: `data:${mimeType};base64,${data.toString("base64")}`,
 	};
 }
 
@@ -1263,6 +1297,13 @@ function timestamp(): string {
 
 function trimTrailingSlash(value: string): string {
 	return value.replace(/\/+$/, "");
+}
+
+function apiUrl(baseUrl: string, path: string): string {
+	const base = trimTrailingSlash(baseUrl);
+	const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+	if (base.endsWith("/v1") && normalizedPath.startsWith("/v1/")) return `${base}${normalizedPath.slice(3)}`;
+	return `${base}${normalizedPath}`;
 }
 
 async function showResult(ctx: ExtensionCommandContext, result: ImageResult): Promise<void> {
