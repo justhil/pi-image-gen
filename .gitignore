@@ -3,3 +3,4 @@ dist/
 .env
 *.tsbuildinfo
 image-gen-output/
+.image-gen/

@@ -2,7 +2,7 @@ import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionC
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { Image, Text } from "@earendil-works/pi-tui";
+import { getCapabilities, Image, Key, matchesKey, Text } from "@earendil-works/pi-tui";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
@@ -13,7 +13,7 @@ const DEFAULT_BASE_URL = "http://<api-host>:<port>";
 const DEFAULT_MODEL = "gpt-image-2";
 const DEFAULT_SIZE = "1024x1024";
 const DEFAULT_RESPONSE_FORMAT: ResponseFormat = "b64_json";
-const DEFAULT_OUTPUT_DIR = "image-gen-output";
+const DEFAULT_OUTPUT_DIR = ".image-gen";
 const IMAGE2_GENERATE_PATH = "/v1/images/generations";
 const IMAGE2_EDIT_PATH = "/v1/images/edits";
 
@@ -23,6 +23,7 @@ type ImageSize = (typeof IMAGE_SIZE_VALUES)[number] | string;
 type ResponseFormat = "b64_json" | "url";
 type Action = "generate" | "edit";
 type ToolAction = "help" | "generate" | "edit" | "status";
+type ReviewChoice = "approve" | "revise" | "reject" | "cancel";
 
 interface ImageGenConfig {
 	baseUrl?: string;
@@ -31,6 +32,7 @@ interface ImageGenConfig {
 	size?: ImageSize;
 	responseFormat?: ResponseFormat;
 	outputDir?: string;
+	reviewToolEnabled?: boolean;
 }
 
 interface ResolvedConfig {
@@ -40,6 +42,7 @@ interface ResolvedConfig {
 	size: string;
 	responseFormat: ResponseFormat;
 	outputDir: string;
+	reviewToolEnabled: boolean;
 }
 
 interface ImageRequestOptions {
@@ -62,6 +65,15 @@ interface ImageApiResponse {
 	};
 }
 
+interface ModelListResponse {
+	data?: Array<{
+		id?: string;
+	}>;
+	error?: {
+		message?: string;
+	};
+}
+
 interface ImageResult {
 	file?: string;
 	url?: string;
@@ -78,6 +90,15 @@ interface ImageGenToolDetails extends ImageResult {
 	size?: string;
 	responseFormat?: ResponseFormat;
 	outputDir?: string;
+	reviewToolEnabled?: boolean;
+}
+
+interface ImageReviewToolDetails {
+	choice: ReviewChoice;
+	feedback?: string;
+	image?: string;
+	title?: string;
+	question?: string;
 }
 
 const IMAGE_GEN_TOOL_PARAMS = Type.Object({
@@ -95,7 +116,18 @@ const IMAGE_GEN_TOOL_PARAMS = Type.Object({
 
 type ImageGenToolParams = Static<typeof IMAGE_GEN_TOOL_PARAMS>;
 
+const IMAGE_REVIEW_TOOL_PARAMS = Type.Object({
+	image: Type.String({ description: "要给用户审查的图片：本地路径、data URL、base64；URL 仅展示链接。" }),
+	title: Type.Optional(Type.String({ description: "审查标题，如 前端概念图审查。" })),
+	question: Type.Optional(Type.String({ description: "要用户确认的问题。" })),
+	context: Type.Optional(Type.String({ description: "简短说明图片用途、页面位置或设计目标。" })),
+	allow_feedback: Type.Optional(Type.Boolean({ description: "是否允许用户输入文字反馈，默认 true。" })),
+});
+
+type ImageReviewToolParams = Static<typeof IMAGE_REVIEW_TOOL_PARAMS>;
+
 const IMAGE_GEN_PROMPT_SNIPPET = "前端设计主场景：先用image_gen生成页面参照效果图、元素图、图标icon、插画/商品图；支持文生图/图生图/改图；先help，未配置/image-gen config。";
+const IMAGE_REVIEW_PROMPT_SNIPPET = "生成前端概念图/素材后用image_review给用户预览确认，收集通过/修改/重做及反馈；可在/image-gen config关闭。";
 
 export default function imageGenExtension(pi: ExtensionAPI) {
 	pi.registerTool({
@@ -118,15 +150,39 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerTool({
+		name: "image_review",
+		label: "Image Review",
+		description: "用户图片审查工具。模型生成前端概念图、页面参照图或前端素材图后，应主动调用此工具，把图片用 TUI 展示给用户确认，并收集通过、修改、重做或文字反馈。可在 /image-gen config 中关闭，关闭后不再注入提示词。",
+		promptSnippet: IMAGE_REVIEW_PROMPT_SNIPPET,
+		parameters: IMAGE_REVIEW_TOOL_PARAMS,
+		executionMode: "sequential",
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return executeImageReviewTool(params, ctx);
+		},
+		renderCall(args, theme) {
+			const title = typeof args.title === "string" ? args.title : "review";
+			return new Text(theme.fg("toolTitle", theme.bold("image_review")) + " " + theme.fg("muted", title), 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
+			return new Text(theme.fg("toolOutput", text), 0, 0);
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		await syncReviewToolActive(pi, ctx);
+	});
+
 	pi.registerCommand("image-gen", {
 		description: "Image2 图片生成 / 图生图 / 配置",
 		handler: async (args, ctx) => {
-			await handleImageGenCommand(args, ctx);
+			await handleImageGenCommand(pi, args, ctx);
 		},
 	});
 }
 
-async function handleImageGenCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
+async function handleImageGenCommand(pi: ExtensionAPI, args: string, ctx: ExtensionCommandContext): Promise<void> {
 	const parsed = parseArgs(args);
 
 	if (parsed.action === "generate") {
@@ -140,7 +196,7 @@ async function handleImageGenCommand(args: string, ctx: ExtensionCommandContext)
 	}
 
 	if (parsed.action === "config") {
-		await configFlow(ctx);
+		await configFlow(pi, ctx);
 		return;
 	}
 
@@ -168,13 +224,36 @@ async function handleImageGenCommand(args: string, ctx: ExtensionCommandContext)
 		"文生图",
 		"图生图 / 编辑",
 		"配置 Image2 API",
+		"审查工具开关",
 		"查看状态",
 	]);
 
 	if (choice === "文生图") await generateFlow(ctx, "");
 	if (choice === "图生图 / 编辑") await editFlow(ctx, "");
-	if (choice === "配置 Image2 API") await configFlow(ctx);
+	if (choice === "配置 Image2 API") await configFlow(pi, ctx);
+	if (choice === "审查工具开关") await reviewToolToggleFlow(pi, ctx);
 	if (choice === "查看状态") await showStatus(ctx);
+}
+
+async function syncReviewToolActive(pi: ExtensionAPI, ctx: Pick<ExtensionContext, "ui">): Promise<void> {
+	const config = await loadConfig();
+	applyReviewToolActive(pi, ctx, config.reviewToolEnabled ?? true);
+}
+
+function applyReviewToolActive(pi: ExtensionAPI, ctx: Pick<ExtensionContext, "ui">, enabled: boolean): void {
+	const active = new Set(pi.getActiveTools());
+	const hasReview = active.has("image_review");
+
+	if (enabled && !hasReview) {
+		active.add("image_review");
+		pi.setActiveTools([...active]);
+	}
+	if (!enabled && hasReview) {
+		active.delete("image_review");
+		pi.setActiveTools([...active]);
+	}
+
+	ctx.ui.setStatus("image-review", enabled ? undefined : "image_review: off");
 }
 
 function parseArgs(args: string): { action?: "generate" | "edit" | "config" | "status" | "help"; rest: string } {
@@ -192,6 +271,61 @@ function parseArgs(args: string): { action?: "generate" | "edit" | "config" | "s
 	if (["help", "-h", "--help", "帮助"].includes(normalized)) return { action: "help", rest };
 
 	return { rest: trimmed };
+}
+
+async function executeImageReviewTool(
+	params: ImageReviewToolParams,
+	ctx: ExtensionContext,
+): Promise<AgentToolResult<ImageReviewToolDetails>> {
+	const config = await loadConfig();
+	if (config.reviewToolEnabled === false) {
+		return {
+			content: [{ type: "text", text: "image_review 已关闭。需要重新启用请运行 /image-gen config。" }],
+			details: { choice: "cancel", image: params.image, title: params.title, question: params.question },
+		};
+	}
+
+	if (!ctx.hasUI) {
+		return {
+			content: [{ type: "text", text: "当前模式没有 TUI，无法进行用户图片审查。" }],
+			details: { choice: "cancel", image: params.image, title: params.title, question: params.question },
+		};
+	}
+
+	let preview: ReviewPreview;
+	try {
+		preview = await loadReviewPreview(params.image, ctx.cwd);
+	} catch (error) {
+		return {
+			content: [{ type: "text", text: `图片审查失败：${error instanceof Error ? error.message : String(error)}` }],
+			details: { choice: "cancel", image: params.image, title: params.title, question: params.question },
+		};
+	}
+	const choice = await showReviewOverlay(ctx, params, preview);
+	let feedback = "";
+	if (choice === "revise" || choice === "reject") {
+		const value = await ctx.ui.editor("请输入图片修改反馈", "");
+		feedback = value?.trim() || "";
+	} else if (params.allow_feedback !== false) {
+		const wantsFeedback = await ctx.ui.confirm("补充反馈？", "是否要补充文字反馈？");
+		if (wantsFeedback) {
+			const value = await ctx.ui.editor("补充反馈", "");
+			feedback = value?.trim() || "";
+		}
+	}
+
+	const details: ImageReviewToolDetails = {
+		choice,
+		feedback: feedback || undefined,
+		image: params.image,
+		title: params.title,
+		question: params.question,
+	};
+	const content: AgentToolResult<ImageReviewToolDetails>["content"] = [{ type: "text", text: formatReviewResult(details) }];
+	if (preview.b64 && preview.mimeType) {
+		content.push({ type: "image", data: preview.b64, mimeType: preview.mimeType });
+	}
+	return { content, details };
 }
 
 async function executeImageGenTool(
@@ -271,7 +405,8 @@ function buildToolHelp(): string {
 		"4. 图生图/编辑：action=edit, image=输入图, prompt=修改要求，例如换背景、统一风格、生成变体。",
 		"5. 前端素材应在 prompt 中说明尺寸比例、透明背景需求、风格、色板、用途和插入位置。",
 		"6. 可选参数：output_name、size、response_format、model。",
-		"7. 未配置时请让用户运行 /image-gen config，不要在工具参数里索要密钥。",
+		"7. 生成前端概念图或素材后，调用 image_review 给用户预览确认并收集反馈。",
+		"8. 未配置时请让用户运行 /image-gen config，不要在工具参数里索要密钥。",
 		"支持 image：本地路径、HTTP URL、data:image/...、裸 base64。",
 		"输出：b64_json/data URL 会保存文件并返回图片块；普通 URL 会保存 JSON。",
 	].join("\n");
@@ -287,6 +422,7 @@ async function buildToolStatus(): Promise<string> {
 		`size: ${details.size}`,
 		`response: ${details.responseFormat}`,
 		`output: ${details.outputDir}`,
+		`image_review: ${details.reviewToolEnabled ? "on" : "off"}`,
 		details.configured ? "可直接 generate/edit。" : "未配置，请运行 /image-gen config。",
 	].join("\n");
 }
@@ -301,6 +437,7 @@ async function buildToolStatusDetails(): Promise<ImageGenToolDetails> {
 		size: config.size,
 		responseFormat: config.responseFormat,
 		outputDir: config.outputDir,
+		reviewToolEnabled: config.reviewToolEnabled,
 	};
 }
 
@@ -356,6 +493,102 @@ async function editFlow(ctx: ExtensionCommandContext, initialPrompt: string): Pr
 	});
 }
 
+interface ReviewPreview {
+	b64?: string;
+	mimeType?: string;
+	label: string;
+	warning?: string;
+}
+
+async function loadReviewPreview(input: string, cwd: string): Promise<ReviewPreview> {
+	const trimmed = input.trim();
+	if (trimmed.startsWith("data:image/")) {
+		const parsed = parseDataUrl(trimmed);
+		return withTerminalImageWarning({ b64: parsed.data, mimeType: parsed.mimeType, label: "data URL" });
+	}
+	if (/^https?:\/\//i.test(trimmed)) {
+		const response = await fetch(trimmed);
+		if (!response.ok) throw new Error(`图片下载失败：HTTP ${response.status}`);
+		const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
+		const mimeType = contentType?.startsWith("image/") ? contentType : mimeFromPath(new URL(trimmed).pathname);
+		const data = Buffer.from(await response.arrayBuffer()).toString("base64");
+		return withTerminalImageWarning({ b64: data, mimeType, label: trimmed });
+	}
+	if (looksLikeBase64(trimmed)) {
+		return withTerminalImageWarning({ b64: trimmed, mimeType: "image/png", label: "base64 image" });
+	}
+
+	const file = isAbsolute(trimmed) ? trimmed : resolve(cwd, trimmed);
+	const data = await readFile(file);
+	return withTerminalImageWarning({ b64: data.toString("base64"), mimeType: mimeFromPath(file), label: file });
+}
+
+function withTerminalImageWarning(preview: ReviewPreview): ReviewPreview {
+	const caps = getCapabilities();
+	if (!caps.images) {
+		return { ...preview, warning: "当前终端不支持 inline image 或已被 pi 禁用，将显示图片占位信息。" };
+	}
+	if (caps.images === "kitty" && preview.mimeType !== "image/png") {
+		return { ...preview, warning: "Kitty/Ghostty/WezTerm 图片协议在 pi 中优先支持 PNG；非 PNG 可能显示为占位信息。" };
+	}
+	return preview;
+}
+
+async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolParams, preview: ReviewPreview): Promise<ReviewChoice> {
+	return ctx.ui.custom<ReviewChoice>((_tui, theme, _keybindings, done) => {
+		const title = params.title?.trim() || "前端图片审查";
+		const question = params.question?.trim() || "这个概念图/素材是否可以继续用于前端实现？";
+		const context = params.context?.trim();
+		const image = preview.b64 && preview.mimeType
+			? new Image(preview.b64, preview.mimeType, { fallbackColor: (text) => theme.fg("muted", text) }, { maxWidthCells: 90, maxHeightCells: 30, filename: safeBasename(preview.label) })
+			: undefined;
+
+		return {
+			render(width: number) {
+				const lines = [
+					theme.fg("accent", theme.bold(title)),
+					context ? theme.fg("muted", context) : "",
+					theme.fg("toolOutput", question),
+					preview.warning ? theme.fg("warning", preview.warning) : "",
+					preview.b64 ? "" : theme.fg("warning", `无法内联预览图片：${preview.label}`),
+				].filter(Boolean);
+				if (image) lines.push("", ...image.render(width));
+				lines.push(
+					"",
+					theme.fg("success", "1 通过，继续实现"),
+					theme.fg("warning", "2 需要修改，输入反馈"),
+					theme.fg("error", "3 重做/拒绝，输入原因"),
+					theme.fg("dim", "Esc 取消"),
+				);
+				return lines;
+			},
+			invalidate() {
+				image?.invalidate();
+			},
+			handleInput(data: string) {
+				if (data === "1") done("approve");
+				else if (data === "2") done("revise");
+				else if (data === "3") done("reject");
+				else if (matchesKey(data, Key.escape)) done("cancel");
+			},
+		};
+	}, { overlay: true, overlayOptions: { width: "85%", maxHeight: "90%", margin: 2 } });
+}
+
+function formatReviewResult(details: ImageReviewToolDetails): string {
+	const label: Record<ReviewChoice, string> = {
+		approve: "用户通过，可以继续前端实现。",
+		revise: "用户要求修改，请根据反馈调整图片或设计。",
+		reject: "用户拒绝/要求重做，请重新生成方案。",
+		cancel: "用户取消审查，停止基于该图片继续推进。",
+	};
+	return [
+		`image_review: ${details.choice}`,
+		label[details.choice],
+		details.feedback ? `反馈：${details.feedback}` : "",
+	].filter(Boolean).join("\n");
+}
+
 function parseEditInlineArgs(value: string): { image: string; prompt: string } {
 	const trimmed = value.trim();
 	const match = trimmed.match(/^(?:--image|-i)\s+(\S+)\s+([\s\S]+)$/);
@@ -379,9 +612,10 @@ async function resolvePrompt(ctx: ExtensionCommandContext, title: string, initia
 	return prompt?.trim() || undefined;
 }
 
-async function configFlow(ctx: ExtensionCommandContext): Promise<void> {
+async function configFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
 	while (true) {
 		const config = await loadConfig();
+		await ensureOutputDir(ctx.cwd, (await resolveConfig()).outputDir);
 		const choice = await ctx.ui.select("Image2 配置", [
 			"查看当前配置",
 			"设置 API Base URL",
@@ -390,12 +624,14 @@ async function configFlow(ctx: ExtensionCommandContext): Promise<void> {
 			"设置尺寸",
 			"设置返回格式",
 			"设置输出目录",
+			`审查工具开关 (${(config.reviewToolEnabled ?? true) ? "on" : "off"})`,
 			"测试连接",
 		]);
 
 		if (!choice) return;
 
 		if (choice === "查看当前配置") {
+			await ensureOutputDir(ctx.cwd, (await resolveConfig()).outputDir);
 			ctx.ui.notify(formatConfig(config), "info");
 			continue;
 		}
@@ -417,8 +653,7 @@ async function configFlow(ctx: ExtensionCommandContext): Promise<void> {
 		}
 
 		if (choice === "设置模型") {
-			const value = await ctx.ui.input("模型 ID", config.model || DEFAULT_MODEL);
-			if (value?.trim()) await saveConfig({ ...config, model: value.trim() });
+			await chooseModelFlow(ctx, config);
 			continue;
 		}
 
@@ -442,7 +677,15 @@ async function configFlow(ctx: ExtensionCommandContext): Promise<void> {
 
 		if (choice === "设置输出目录") {
 			const value = await ctx.ui.input("输出目录", config.outputDir || DEFAULT_OUTPUT_DIR);
-			if (value?.trim()) await saveConfig({ ...config, outputDir: value.trim() });
+			if (value?.trim()) {
+				await saveConfig({ ...config, outputDir: value.trim() });
+				await ensureOutputDir(ctx.cwd, value.trim());
+			}
+			continue;
+		}
+
+		if (choice.startsWith("审查工具开关")) {
+			await reviewToolToggleFlow(pi, ctx);
 			continue;
 		}
 
@@ -452,7 +695,78 @@ async function configFlow(ctx: ExtensionCommandContext): Promise<void> {
 	}
 }
 
+async function chooseModelFlow(ctx: ExtensionCommandContext, config: ImageGenConfig): Promise<void> {
+	const resolved = await resolveConfig();
+	let models: string[] = [];
+
+	if (resolved.baseUrl && resolved.baseUrl !== DEFAULT_BASE_URL && resolved.apiKey) {
+		ctx.ui.setStatus(EXTENSION_NAME, "image-gen: loading models");
+		try {
+			models = await fetchModels(resolved);
+		} catch (error) {
+			ctx.ui.notify(`获取模型列表失败，改为手动输入：${error instanceof Error ? error.message : String(error)}`, "warning");
+		} finally {
+			ctx.ui.setStatus(EXTENSION_NAME, undefined);
+		}
+	} else {
+		ctx.ui.notify("先配置 API Base URL 和 API Key，才能自动获取模型列表。", "warning");
+	}
+
+	const current = resolved.model || DEFAULT_MODEL;
+	if (models.length > 0) {
+		const options = [...new Set([current, ...models]), "手动输入"];
+		const selected = await ctx.ui.select("选择模型", options);
+		if (!selected) return;
+		if (selected !== "手动输入") {
+			await saveConfig({ ...config, model: selected });
+			return;
+		}
+	}
+
+	const value = await ctx.ui.input("模型 ID", current);
+	if (value?.trim()) await saveConfig({ ...config, model: value.trim() });
+}
+
+async function fetchModels(config: ResolvedConfig): Promise<string[]> {
+	const response = await fetch(`${config.baseUrl}/v1/models`, {
+		headers: { Authorization: `Bearer ${config.apiKey}` },
+	});
+	const text = await response.text();
+	if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
+
+	let json: ModelListResponse;
+	try {
+		json = JSON.parse(text) as ModelListResponse;
+	} catch {
+		throw new Error(`返回非 JSON：${text.slice(0, 120)}`);
+	}
+	if (json.error?.message) throw new Error(json.error.message);
+
+	const models = (json.data || [])
+		.map((item) => item.id)
+		.filter((id): id is string => Boolean(id?.trim()))
+		.sort((a, b) => a.localeCompare(b));
+	if (models.length === 0) throw new Error("/v1/models 未返回可用模型 ID");
+	return models;
+}
+
+async function reviewToolToggleFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
+	const config = await loadConfig();
+	const enabled = config.reviewToolEnabled ?? true;
+	const choice = await ctx.ui.select("image_review 审查工具", [
+		enabled ? "保持开启" : "开启审查工具",
+		enabled ? "关闭审查工具" : "保持关闭",
+	]);
+	if (!choice || choice.startsWith("保持")) return;
+
+	const nextEnabled = choice.startsWith("开启");
+	await saveConfig({ ...config, reviewToolEnabled: nextEnabled });
+	applyReviewToolActive(pi, ctx, nextEnabled);
+	ctx.ui.notify(nextEnabled ? "image_review 已开启，审查工具提示词已恢复注入。" : "image_review 已关闭，审查工具提示词已停止注入。", "info");
+}
+
 async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
+	await ensureOutputDir(ctx.cwd, (await resolveConfig()).outputDir);
 	ctx.ui.notify(formatConfig(await loadConfig()), "info");
 }
 
@@ -515,8 +829,7 @@ async function requestImage(ctx: { cwd: string }, options: ImageRequestOptions, 
 	const first = json.data?.[0];
 	if (!first) throw new Error("Image2 未返回 data[0]");
 
-	const outputDir = resolveOutputDir(ctx.cwd, config.outputDir);
-	await mkdir(outputDir, { recursive: true });
+	const outputDir = await ensureOutputDir(ctx.cwd, config.outputDir);
 
 	if (first.b64_json) {
 		const file = resolveOutputFile(outputDir, options.outputName, "png");
@@ -594,6 +907,7 @@ async function resolveConfig(): Promise<ResolvedConfig> {
 		size: process.env.IMAGE2_SIZE || process.env.IMAGE_SIZE || config.size || DEFAULT_SIZE,
 		responseFormat: normalizeResponseFormat(process.env.IMAGE2_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || config.responseFormat),
 		outputDir: process.env.IMAGE2_OUTPUT_DIR || process.env.IMAGE_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT_DIR,
+		reviewToolEnabled: config.reviewToolEnabled ?? true,
 	};
 }
 
@@ -619,6 +933,7 @@ function formatConfig(config: ImageGenConfig): string {
 		`Size: ${process.env.IMAGE2_SIZE || process.env.IMAGE_SIZE || config.size || DEFAULT_SIZE}`,
 		`Response: ${process.env.IMAGE2_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || config.responseFormat || DEFAULT_RESPONSE_FORMAT}`,
 		`Output: ${process.env.IMAGE2_OUTPUT_DIR || process.env.IMAGE_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT_DIR}`,
+		`Review tool: ${(config.reviewToolEnabled ?? true) ? "on" : "off"}`,
 	].join("\n");
 }
 
@@ -667,6 +982,17 @@ function extensionFromMime(mimeType: string): string {
 	if (mimeType === "image/webp") return "webp";
 	if (mimeType === "image/gif") return "gif";
 	return "png";
+}
+
+function safeBasename(value: string): string | undefined {
+	if (/^https?:\/\//i.test(value)) return undefined;
+	return basename(value);
+}
+
+async function ensureOutputDir(cwd: string, outputDir: string): Promise<string> {
+	const dir = resolveOutputDir(cwd, outputDir);
+	await mkdir(dir, { recursive: true });
+	return dir;
 }
 
 function resolveOutputDir(cwd: string, outputDir: string): string {
