@@ -1,0 +1,33 @@
+{
+  "name": "pi-image-gen",
+  "version": "0.1.0",
+  "description": "Pi image generation extension. One /image-gen command with Image2 text-to-image and image-to-image support.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "image-generation",
+    "gpt-image-2",
+    "image2"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.1",
+    "@earendil-works/pi-tui": "^0.74.1",
+    "@types/node": "^24.3.0",
+    "typescript": "^5.7.3"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit"
+  }
+}
