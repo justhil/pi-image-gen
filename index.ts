@@ -85,9 +85,16 @@ interface ImageResult {
 }
 
 interface EditImageInput {
-	blob: Blob;
+	buffer: Buffer;
 	filename: string;
-	dataUrl: string;
+	mimeType: string;
+}
+
+interface MultipartField {
+	name: string;
+	value: string | Buffer;
+	filename?: string;
+	contentType?: string;
 }
 
 interface ImageGenToolDetails extends ImageResult {
@@ -1016,31 +1023,23 @@ async function requestImage(ctx: { cwd: string }, options: ImageRequestOptions, 
 			size: options.size || config.size,
 			response_format: options.responseFormat || config.responseFormat,
 		};
-		const form = new FormData();
-		form.append("model", editPayload.model);
-		form.append("prompt", editPayload.prompt);
-		form.append("size", editPayload.size);
-		form.append("response_format", editPayload.response_format);
-		form.append("image", image.blob, image.filename);
+		const multipart = encodeMultipartForm([
+			{ name: "model", value: editPayload.model },
+			{ name: "prompt", value: editPayload.prompt },
+			{ name: "size", value: editPayload.size },
+			{ name: "response_format", value: editPayload.response_format },
+			{ name: "image", value: image.buffer, filename: image.filename, contentType: image.mimeType },
+		]);
 		response = await fetch(apiUrl(config.baseUrl, IMAGE2_EDIT_PATH), {
 			method: "POST",
-			headers: { Authorization: `Bearer ${config.apiKey}` },
-			body: form,
+			headers: {
+				Authorization: `Bearer ${config.apiKey}`,
+				"Content-Type": multipart.contentType,
+			},
+			body: new Uint8Array(multipart.body),
 			signal,
 		});
 		text = await response.text();
-		if (!response.ok && shouldRetryEditAsJson(response.status, text) && !signal?.aborted) {
-			response = await fetch(apiUrl(config.baseUrl, IMAGE2_EDIT_PATH), {
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${config.apiKey}`,
-					"Content-Type": "application/json",
-				},
-				body: JSON.stringify({ ...editPayload, image: image.dataUrl, images: [image.dataUrl] }),
-				signal,
-			});
-			text = await response.text();
-		}
 	} else {
 		const body: Record<string, unknown> = {
 			model: options.model || config.model,
@@ -1197,10 +1196,25 @@ function maskSecret(value: string | undefined): string {
 	return `${value.slice(0, 4)}${"*".repeat(Math.max(4, value.length - 8))}${value.slice(-4)}`;
 }
 
-function shouldRetryEditAsJson(status: number, text: string): boolean {
-	if (status !== 400 && status !== 415 && status !== 422) return false;
-	const lower = text.toLowerCase();
-	return lower.includes("prompt") || lower.includes("content-type") || lower.includes("json") || lower.includes("field required");
+function encodeMultipartForm(fields: MultipartField[]): { body: Buffer; contentType: string } {
+	const boundary = `----pi-image-gen-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+	const chunks: Buffer[] = [];
+	for (const field of fields) {
+		chunks.push(Buffer.from(`--${boundary}\r\n`));
+		if (Buffer.isBuffer(field.value)) {
+			chunks.push(Buffer.from(`Content-Disposition: form-data; name="${escapeMultipartName(field.name)}"; filename="${escapeMultipartName(field.filename || "image.png")}"\r\n`));
+			chunks.push(Buffer.from(`Content-Type: ${field.contentType || "application/octet-stream"}\r\n\r\n`));
+			chunks.push(field.value, Buffer.from("\r\n"));
+		} else {
+			chunks.push(Buffer.from(`Content-Disposition: form-data; name="${escapeMultipartName(field.name)}"\r\n\r\n${field.value}\r\n`));
+		}
+	}
+	chunks.push(Buffer.from(`--${boundary}--\r\n`));
+	return { body: Buffer.concat(chunks), contentType: `multipart/form-data; boundary=${boundary}` };
+}
+
+function escapeMultipartName(value: string): string {
+	return value.replace(/["\r\n]/g, "_");
 }
 
 async function downloadImageResult(url: string): Promise<{ buffer: Buffer; mimeType: string } | undefined> {
@@ -1252,9 +1266,9 @@ function buildEditImageInput(buffer: Buffer, hintedMimeType: string | undefined,
 	}
 	const safeName = filename && extname(filename) ? filename : `input.${extensionFromMime(mimeType)}`;
 	return {
-		blob: new Blob([new Uint8Array(buffer)], { type: mimeType }),
+		buffer,
 		filename: safeName,
-		dataUrl: `data:${mimeType};base64,${buffer.toString("base64")}`,
+		mimeType,
 	};
 }
 
