@@ -157,7 +157,7 @@ edit      图生图 / 图片编辑 / 换背景 / 统一风格
 ```text
 action           help | generate | edit | status
 prompt           生图/编辑提示词
-image            edit 输入图：本地路径、URL、data URL 或 base64
+image            edit 输入图：本地路径、URL、data URL 或 base64；会校验 jpeg/png/gif/webp 文件头
 output_name      输出文件名
 size             可选尺寸覆盖，如 1024x1024
 response_format  b64_json | url

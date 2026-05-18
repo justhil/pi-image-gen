@@ -1091,8 +1091,16 @@ async function requestImage(ctx: { cwd: string }, options: ImageRequestOptions, 
 	}
 
 	if (first.url) {
-		const responseFile = resolveOutputFile(outputDir, options.outputName || "image-url", "json");
+		const responseFile = resolveOutputFile(outputDir, responseOutputName(options.outputName || "image-url"), "json");
 		await writeFile(responseFile, JSON.stringify(json, null, 2), "utf8");
+		if (/^https?:\/\//i.test(first.url)) {
+			const downloaded = await downloadImageResult(first.url);
+			if (downloaded) {
+				const file = resolveOutputFile(outputDir, options.outputName || basename(new URL(first.url).pathname), extensionFromMime(downloaded.mimeType));
+				await writeFile(file, downloaded.buffer);
+				return { file, url: first.url, responseFile, b64: downloaded.buffer.toString("base64"), mimeType: downloaded.mimeType };
+			}
+		}
 		return { url: first.url, responseFile };
 	}
 
@@ -1195,46 +1203,74 @@ function shouldRetryEditAsJson(status: number, text: string): boolean {
 	return lower.includes("prompt") || lower.includes("content-type") || lower.includes("json") || lower.includes("field required");
 }
 
+async function downloadImageResult(url: string): Promise<{ buffer: Buffer; mimeType: string } | undefined> {
+	const response = await fetch(url);
+	if (!response.ok) return undefined;
+	const buffer = Buffer.from(await response.arrayBuffer());
+	const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
+	const mimeType = detectImageMime(buffer) || (isSupportedImageMime(contentType) ? contentType : undefined);
+	return mimeType ? { buffer, mimeType } : undefined;
+}
+
+function responseOutputName(name: string): string {
+	const extension = extname(name);
+	const stem = extension ? name.slice(0, -extension.length) : name;
+	return `${stem}-response.json`;
+}
+
 async function normalizeEditImageInput(input: string, cwd: string): Promise<EditImageInput> {
 	const trimmed = input.trim();
 	if (/^https?:\/\//i.test(trimmed)) {
 		const response = await fetch(trimmed);
 		if (!response.ok) throw new Error(`图片下载失败：HTTP ${response.status}`);
 		const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
-		const mimeType = contentType?.startsWith("image/") ? contentType : mimeFromPath(new URL(trimmed).pathname);
 		const buffer = Buffer.from(await response.arrayBuffer());
-		return {
-			blob: new Blob([buffer], { type: mimeType }),
-			filename: basename(new URL(trimmed).pathname) || `input.${extensionFromMime(mimeType)}`,
-			dataUrl: `data:${mimeType};base64,${buffer.toString("base64")}`,
-		};
+		const mimeType = detectImageMime(buffer) || (contentType?.startsWith("image/") ? contentType : undefined);
+		return buildEditImageInput(buffer, mimeType, basename(new URL(trimmed).pathname), trimmed);
 	}
 	if (trimmed.startsWith("data:image/")) {
 		const parsed = parseDataUrl(trimmed);
 		const buffer = Buffer.from(parsed.data, "base64");
-		return {
-			blob: new Blob([buffer], { type: parsed.mimeType }),
-			filename: `input.${extensionFromMime(parsed.mimeType)}`,
-			dataUrl: `data:${parsed.mimeType};base64,${buffer.toString("base64")}`,
-		};
+		return buildEditImageInput(buffer, parsed.mimeType, "input", "data URL");
 	}
 	if (looksLikeBase64(trimmed)) {
 		const buffer = Buffer.from(trimmed, "base64");
-		return {
-			blob: new Blob([buffer], { type: "image/png" }),
-			filename: "input.png",
-			dataUrl: `data:image/png;base64,${buffer.toString("base64")}`,
-		};
+		return buildEditImageInput(buffer, undefined, "input", "base64 image");
 	}
 
 	const file = isAbsolute(trimmed) ? trimmed : resolve(cwd, trimmed);
 	const data = await readFile(file);
-	const mimeType = mimeFromPath(file);
+	return buildEditImageInput(data, mimeFromPath(file), basename(file), file);
+}
+
+function buildEditImageInput(buffer: Buffer, hintedMimeType: string | undefined, filename: string, label: string): EditImageInput {
+	const detectedMimeType = detectImageMime(buffer);
+	const mimeType = detectedMimeType || (isSupportedImageMime(hintedMimeType) ? hintedMimeType : undefined);
+	if (!mimeType) {
+		const head = buffer.subarray(0, 16).toString("hex") || "empty";
+		throw new Error(`输入图不是有效图片：${label}。仅支持 jpeg/png/gif/webp；文件头=${head}`);
+	}
+	const safeName = filename && extname(filename) ? filename : `input.${extensionFromMime(mimeType)}`;
 	return {
-		blob: new Blob([data], { type: mimeType }),
-		filename: basename(file) || `input.${extensionFromMime(mimeType)}`,
-		dataUrl: `data:${mimeType};base64,${data.toString("base64")}`,
+		blob: new Blob([new Uint8Array(buffer)], { type: mimeType }),
+		filename: safeName,
+		dataUrl: `data:${mimeType};base64,${buffer.toString("base64")}`,
 	};
+}
+
+function detectImageMime(buffer: Buffer): string | undefined {
+	if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+	if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+	if (buffer.length >= 6) {
+		const gifHeader = buffer.subarray(0, 6).toString("ascii");
+		if (gifHeader === "GIF87a" || gifHeader === "GIF89a") return "image/gif";
+	}
+	if (buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+	return undefined;
+}
+
+function isSupportedImageMime(value: string | undefined): value is string {
+	return value === "image/jpeg" || value === "image/png" || value === "image/gif" || value === "image/webp";
 }
 
 function looksLikeImageInput(value: string): boolean {
