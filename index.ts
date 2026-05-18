@@ -3,7 +3,7 @@ import type { Component, EditorTheme, Focusable } from "@earendil-works/pi-tui";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { Editor, getCapabilities, Image, Key, matchesKey, SelectList, Text, truncateToWidth, wrapTextWithAnsi, type SelectItem, type SelectListTheme } from "@earendil-works/pi-tui";
+import { Editor, getCapabilities, Image, Key, matchesKey, SelectList, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type SelectItem, type SelectListTheme } from "@earendil-works/pi-tui";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -84,6 +84,11 @@ interface ImageResult {
 	mimeType?: string;
 }
 
+interface EditImageInput {
+	blob: Blob;
+	filename: string;
+}
+
 interface ImageGenToolDetails extends ImageResult {
 	action: ToolAction;
 	configured?: boolean;
@@ -122,7 +127,7 @@ type ImageGenToolParams = Static<typeof IMAGE_GEN_TOOL_PARAMS>;
 
 const IMAGE_REVIEW_TOOL_PARAMS = Type.Object({
 	image: Type.String({ description: "要给用户审查的图片：本地路径、URL、data URL 或 base64。" }),
-	title: Type.Optional(Type.String({ description: "审查标题，如 前端概念图审查。" })),
+	title: Type.Optional(Type.String({ description: "审查标题，如 图片审查。" })),
 	question: Type.Optional(Type.String({ description: "要用户确认的问题。" })),
 	context: Type.Optional(Type.String({ description: "简短说明图片用途、页面位置或设计目标。" })),
 	options: Type.Optional(Type.Array(Type.String(), { description: "可选自定义按钮文案，最多 4 个；默认：通过、需要修改、重做、取消。" })),
@@ -131,14 +136,14 @@ const IMAGE_REVIEW_TOOL_PARAMS = Type.Object({
 
 type ImageReviewToolParams = Static<typeof IMAGE_REVIEW_TOOL_PARAMS>;
 
-const IMAGE_GEN_PROMPT_SNIPPET = "前端设计主场景：先用image_gen生成页面参照效果图、元素图、图标icon、插画/商品图；支持文生图/图生图/改图；先help，未配置/image-gen config。";
-const IMAGE_REVIEW_PROMPT_SNIPPET = "生成前端概念图/素材后用image_review给用户预览确认，收集通过/修改/重做及反馈；可在/image-gen config关闭。";
+const IMAGE_GEN_PROMPT_SNIPPET = "前端/UI设计优先考虑调用image_gen生成参考图或素材；也支持通用生图/编辑，未配置用/image-gen config。";
+const IMAGE_REVIEW_PROMPT_SNIPPET = "用image_review展示图片给用户确认并收集反馈；可在/image-gen config关闭。";
 
 export default function imageGenExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "image_gen",
 		label: "Image Gen",
-		description: "Image2 图片生成工具。前端设计是主场景：设计页面前先生成参照效果图，再按需生成页面要插入的元素图片、图标 icon、插画、商品图、空状态图、背景图等素材；也支持通用文生图、图生图、改图、换背景、换风格。先用 action=help 获取完整参数说明；未配置时提示用户运行 /image-gen config。",
+		description: "Image2 图片生成/编辑工具。前端/UI 设计时优先考虑生成参考图或素材；同时支持通用文生图、图生图、改图、换背景、换风格。先用 action=help 获取完整参数说明；未配置时提示用户运行 /image-gen config。",
 		promptSnippet: IMAGE_GEN_PROMPT_SNIPPET,
 		parameters: IMAGE_GEN_TOOL_PARAMS,
 		executionMode: "sequential",
@@ -158,7 +163,7 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "image_review",
 		label: "Image Review",
-		description: "用户图片审查工具。模型生成前端概念图、页面参照图或前端素材图后，应主动调用此工具，把图片用 TUI 展示给用户确认，并收集通过、修改、重做或文字反馈。可在 /image-gen config 中关闭，关闭后不再注入提示词。",
+		description: "用户图片审查工具。需要用户确认图片时调用此工具，用 TUI 展示图片并收集通过、修改、重做或文字反馈。可在 /image-gen config 中关闭，关闭后不再注入提示词。",
 		promptSnippet: IMAGE_REVIEW_PROMPT_SNIPPET,
 		parameters: IMAGE_REVIEW_TOOL_PARAMS,
 		executionMode: "sequential",
@@ -394,14 +399,14 @@ function toolTextResult(
 
 function buildToolHelp(): string {
 	return [
-		"image_gen 前端优先使用规范：",
-		"1. 做 landing page、dashboard、移动端、官网、组件库前，先生成页面参照效果图，作为视觉方向和氛围基准。",
-		"2. 实现页面时，生成需要插入的元素图片、图标 icon、插画、商品图、空状态图、背景图、卡片装饰图。",
-		"3. 文生图：action=generate, prompt=图片/页面效果描述。",
-		"4. 图生图/编辑：action=edit, image=输入图, prompt=修改要求，例如换背景、统一风格、生成变体。",
-		"5. 前端素材应在 prompt 中说明尺寸比例、透明背景需求、风格、色板、用途和插入位置。",
+		"image_gen 使用说明：",
+		"1. 文生图：action=generate，prompt=图片描述。",
+		"2. 图生图/编辑：action=edit，image=输入图，prompt=修改要求。",
+		"3. 前端/UI 设计是高频场景：可生成页面参考图、图标、插画、商品图、空状态图、背景图。",
+		"4. 其他场景同样可用：概念图、产品图、换背景、风格变体、通用插画。",
+		"5. prompt 建议写清：主体、风格、比例/尺寸、色彩、用途、是否透明背景。",
 		"6. 可选参数：output_name、size、response_format、model。",
-		"7. 生成前端概念图或素材后，调用 image_review 给用户预览确认并收集反馈。",
+		"7. 需要用户确认图片时，调用 image_review 展示并收集反馈。",
 		"8. 未配置时请让用户运行 /image-gen config，不要在工具参数里索要密钥。",
 		"支持 image：本地路径、HTTP URL、data:image/...、裸 base64。",
 		"输出：b64_json/data URL 会保存文件并返回图片块；普通 URL 会保存 JSON。",
@@ -614,24 +619,24 @@ function reviewEditorTheme(theme: ExtensionContext["ui"]["theme"]): EditorTheme 
 
 function reviewOptions(params: ImageReviewToolParams): ReviewOption[] {
 	const labels = (params.options || []).map((item) => item.trim()).filter(Boolean).slice(0, 4);
-	const defaults = ["通过，继续实现", "需要修改", "重做/拒绝", "取消"];
+	const defaults = ["通过", "需要修改", "重做", "取消"];
 	const [approve, revise, reject, cancel] = [...labels, ...defaults.slice(labels.length)];
 	const options: ReviewOption[] = [
-		{ value: "approve", title: approve, description: "图片方向可用，继续后续前端实现。" },
-		{ value: "revise", title: revise, description: "保留方向，但需要在下方编辑器填写修改反馈。" },
-		{ value: "reject", title: reject, description: "当前方案不可用，需要在下方编辑器填写重做原因。" },
-		{ value: "cancel", title: cancel, description: "暂停审查，不基于这张图片推进。" },
+		{ value: "approve", title: approve, description: "认可这张图片。" },
+		{ value: "revise", title: revise, description: "保留方向，并填写修改反馈。" },
+		{ value: "reject", title: reject, description: "不采用这张图片，并填写原因。" },
+		{ value: "cancel", title: cancel, description: "取消本次审查。" },
 	];
 	if (params.allow_feedback !== false) {
-		options.splice(3, 0, { value: "freeform", title: "输入自定义反馈", description: "不选择预设结论，直接输入完整反馈。" });
+		options.splice(3, 0, { value: "freeform", title: "自定义反馈", description: "直接输入完整反馈。" });
 	}
 	return options;
 }
 
 async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolParams, preview: ReviewPreview): Promise<ReviewOverlayResult> {
 	return ctx.ui.custom<ReviewOverlayResult>((tui, theme, keybindings, done) => {
-		const title = params.title?.trim() || "前端图片审查";
-		const question = params.question?.trim() || "这个概念图/素材是否可以继续用于前端实现？";
+		const title = params.title?.trim() || "图片审查";
+		const question = params.question?.trim() || "这张图片是否可用？";
 		const context = params.context?.trim();
 		const options = reviewOptions(params);
 		const selectItems: SelectItem[] = options.map((option) => ({ value: option.value, label: option.title, description: option.description }));
@@ -686,18 +691,21 @@ async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolP
 		const component: Component & Focusable = {
 			focused: true,
 			render(width: number) {
-				const lines = renderReviewHeader(theme, width, title, question, context, preview);
-				if (image) lines.push("", ...image.render(width));
-				else lines.push("", theme.fg("muted", preview.file ? `[Image saved: ${preview.file}]` : `[Image: ${preview.mimeType || "image"}]`));
+				const panelWidth = Math.max(40, width);
+				const lines = renderPanelBox(theme, panelWidth, "审查说明", renderReviewHeader(theme, panelWidth - 4, title, question, context, preview));
 
-				lines.push("", theme.fg("accent", "选择结果"));
-				if (mode === "select") lines.push(...renderReviewSelectPane(theme, width, selectList, selected));
+				lines.push("", reviewSectionTitle(theme, "图片预览"));
+				if (image) lines.push(...image.render(panelWidth));
+				else lines.push(...renderPanelBox(theme, panelWidth, "图片文件", [theme.fg("muted", preview.file ? `已保存，外部查看器已尝试打开：${preview.file}` : `[Image: ${preview.mimeType || "image"}]`)]));
+
+				lines.push("", reviewSectionTitle(theme, mode === "select" ? "选择结果" : "填写反馈"));
+				if (mode === "select") lines.push(...renderPanelBox(theme, panelWidth, "决策", renderReviewSelectPane(theme, panelWidth - 4, selectList, selected)));
 				else {
-					lines.push(theme.fg("accent", selected.title));
-					lines.push(theme.fg("muted", selected.description));
-					lines.push("", theme.fg("dim", "输入反馈：Enter 提交 · Esc 返回选项"), ...editor.render(width));
+					lines.push(...renderPanelBox(theme, panelWidth, selected.title, [theme.fg("muted", selected.description)]));
+					lines.push(...editor.render(panelWidth));
 				}
-				lines.push("", theme.fg("dim", mode === "select" ? "输入文字可过滤 · ↑↓/Ctrl+j/k 切换 · Enter 选择 · Esc 取消" : "多行反馈可直接编辑；Esc 返回选项"));
+				const hint = mode === "select" ? "输入文字过滤 · ↑↓/Ctrl+j/k 切换 · Enter 选择 · Esc 取消" : "Enter 提交反馈 · Esc 返回选项";
+				lines.push("", ...renderPanelBox(theme, panelWidth, "快捷键", [theme.fg("dim", hint)]));
 				return lines;
 			},
 			invalidate() {
@@ -741,6 +749,29 @@ function renderReviewHeader(theme: ExtensionContext["ui"]["theme"], width: numbe
 	].filter(Boolean);
 }
 
+function reviewSectionTitle(theme: ExtensionContext["ui"]["theme"], title: string): string {
+	return theme.bg("toolSuccessBg", ` ${theme.fg("accent", theme.bold(title))} `);
+}
+
+function renderPanelBox(theme: ExtensionContext["ui"]["theme"], width: number, title: string, content: string[]): string[] {
+	const innerWidth = Math.max(20, width - 4);
+	const border = theme.fg("borderMuted", "─".repeat(innerWidth + 2));
+	const titleText = ` ${title} `;
+	const top = `${theme.fg("borderMuted", "╭")}${theme.fg("borderAccent", truncateToWidth(titleText, innerWidth, "…"))}${border.slice(Math.min(visibleWidth(titleText), innerWidth))}${theme.fg("borderMuted", "╮")}`;
+	const body = content.length > 0 ? content : [""];
+	return [
+		top,
+		...body.flatMap((line) => wrapTextWithAnsi(line, innerWidth)).map((line) => renderPanelLine(theme, innerWidth, line)),
+		`${theme.fg("borderMuted", "╰")}${theme.fg("borderMuted", "─".repeat(innerWidth + 2))}${theme.fg("borderMuted", "╯")}`,
+	];
+}
+
+function renderPanelLine(theme: ExtensionContext["ui"]["theme"], innerWidth: number, line: string): string {
+	const truncated = truncateToWidth(line, innerWidth, "…");
+	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(truncated)));
+	return `${theme.fg("borderMuted", "│ ")}${theme.bg("toolPendingBg", `${truncated}${padding}`)}${theme.fg("borderMuted", " │")}`;
+}
+
 function renderReviewSelectPane(theme: ExtensionContext["ui"]["theme"], width: number, selectList: SelectList, selected: ReviewOption): string[] {
 	if (width < 84) return selectList.render(width);
 	const leftWidth = Math.floor(width * 0.43);
@@ -760,10 +791,10 @@ function renderReviewSelectPane(theme: ExtensionContext["ui"]["theme"], width: n
 
 function formatReviewResult(details: ImageReviewToolDetails): string {
 	const label: Record<ReviewChoice, string> = {
-		approve: "用户通过，可以继续前端实现。",
-		revise: "用户要求修改，请根据反馈调整图片或设计。",
-		reject: "用户拒绝/要求重做，请重新生成方案。",
-		cancel: "用户取消审查，停止基于该图片继续推进。",
+		approve: "用户通过。",
+		revise: "用户要求修改。",
+		reject: "用户要求重做。",
+		cancel: "用户取消审查。",
 	};
 	return [
 		`image_review: ${details.choice}`,
@@ -973,28 +1004,39 @@ async function requestImage(ctx: { cwd: string }, options: ImageRequestOptions, 
 	const config = await resolveConfig();
 	validateConfig(config);
 
-	const body: Record<string, unknown> = {
-		model: options.model || config.model,
-		prompt: options.prompt,
-		size: options.size || config.size,
-		response_format: options.responseFormat || config.responseFormat,
-	};
-
+	let response: Response;
 	if (options.action === "edit") {
 		if (!options.image) throw new Error("图生图需要 image 输入");
-		body.image = await normalizeImageInput(options.image, ctx.cwd);
+		const image = await normalizeEditImageInput(options.image, ctx.cwd);
+		const form = new FormData();
+		form.append("model", options.model || config.model);
+		form.append("prompt", options.prompt);
+		form.append("size", options.size || config.size);
+		form.append("response_format", options.responseFormat || config.responseFormat);
+		form.append("image", image.blob, image.filename);
+		response = await fetch(`${config.baseUrl}${IMAGE2_EDIT_PATH}`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${config.apiKey}` },
+			body: form,
+			signal,
+		});
+	} else {
+		const body: Record<string, unknown> = {
+			model: options.model || config.model,
+			prompt: options.prompt,
+			size: options.size || config.size,
+			response_format: options.responseFormat || config.responseFormat,
+		};
+		response = await fetch(`${config.baseUrl}${IMAGE2_GENERATE_PATH}`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${config.apiKey}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify(body),
+			signal,
+		});
 	}
-
-	const endpoint = options.action === "edit" ? IMAGE2_EDIT_PATH : IMAGE2_GENERATE_PATH;
-	const response = await fetch(`${config.baseUrl}${endpoint}`, {
-		method: "POST",
-		headers: {
-			Authorization: `Bearer ${config.apiKey}`,
-			"Content-Type": "application/json",
-		},
-		body: JSON.stringify(body),
-		signal,
-	});
 
 	const text = await response.text();
 	if (!response.ok) {
@@ -1126,15 +1168,39 @@ function maskSecret(value: string | undefined): string {
 	return `${value.slice(0, 4)}${"*".repeat(Math.max(4, value.length - 8))}${value.slice(-4)}`;
 }
 
-async function normalizeImageInput(input: string, cwd: string): Promise<string> {
+async function normalizeEditImageInput(input: string, cwd: string): Promise<EditImageInput> {
 	const trimmed = input.trim();
-	if (/^https?:\/\//i.test(trimmed) || trimmed.startsWith("data:image/")) return trimmed;
-	if (looksLikeBase64(trimmed)) return trimmed;
+	if (/^https?:\/\//i.test(trimmed)) {
+		const response = await fetch(trimmed);
+		if (!response.ok) throw new Error(`图片下载失败：HTTP ${response.status}`);
+		const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
+		const mimeType = contentType?.startsWith("image/") ? contentType : mimeFromPath(new URL(trimmed).pathname);
+		return {
+			blob: new Blob([await response.arrayBuffer()], { type: mimeType }),
+			filename: basename(new URL(trimmed).pathname) || `input.${extensionFromMime(mimeType)}`,
+		};
+	}
+	if (trimmed.startsWith("data:image/")) {
+		const parsed = parseDataUrl(trimmed);
+		return {
+			blob: new Blob([Buffer.from(parsed.data, "base64")], { type: parsed.mimeType }),
+			filename: `input.${extensionFromMime(parsed.mimeType)}`,
+		};
+	}
+	if (looksLikeBase64(trimmed)) {
+		return {
+			blob: new Blob([Buffer.from(trimmed, "base64")], { type: "image/png" }),
+			filename: "input.png",
+		};
+	}
 
 	const file = isAbsolute(trimmed) ? trimmed : resolve(cwd, trimmed);
 	const data = await readFile(file);
 	const mimeType = mimeFromPath(file);
-	return `data:${mimeType};base64,${data.toString("base64")}`;
+	return {
+		blob: new Blob([data], { type: mimeType }),
+		filename: basename(file) || `input.${extensionFromMime(mimeType)}`,
+	};
 }
 
 function looksLikeImageInput(value: string): boolean {
