@@ -410,7 +410,7 @@ function buildToolHelp(): string {
 		"7. 需要用户确认图片时，调用 image_review 展示并收集反馈。",
 		"8. 未配置时请让用户运行 /image-gen config，不要在工具参数里索要密钥。",
 		"支持 image：本地路径、HTTP URL、data:image/...、裸 base64。",
-		"输出：b64_json/data URL 会保存文件并返回图片块；普通 URL 会保存 JSON。",
+		"输出：b64_json/data URL/普通图片 URL 都会保存图片；URL 响应另存 *-response.json。",
 	].join("\n");
 }
 

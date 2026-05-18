@@ -282,4 +282,4 @@ TUI 下最多进入一层表单，不再拆更多 slash command。
 
 `b64_json` 或 `data:` URL 响应会直接保存成图片，并在支持图片协议的终端里弹出 TUI 预览。
 
-普通 URL 响应不会下载远程图片，只会把完整 JSON 响应保存到本地，并在通知里显示 URL。
+普通图片 URL 响应会下载真实图片保存到 `output_name`，并把完整 JSON 响应另存为 `*-response.json`。
