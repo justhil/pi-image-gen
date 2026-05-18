@@ -180,18 +180,22 @@ image_review
 生成前端概念图/素材后用image_review给用户预览确认，收集通过/修改/重做及反馈；可在/image-gen config关闭。
 ```
 
-用途：模型生成前端概念图、页面参照图或素材图后，主动调用 `image_review`，用 pi TUI `Image` 组件把图片直接渲染到终端给用户确认。支持本地路径、HTTP/HTTPS URL、`data:image/...` 和裸 base64；URL 会先下载为 base64 再渲染。
+用途：模型生成前端概念图、页面参照图或素材图后，主动调用 `image_review`，用 TUI 审查面板把图片直接渲染到终端给用户确认。支持本地路径、HTTP/HTTPS URL、`data:image/...` 和裸 base64；URL 会先下载为 base64 再渲染。
 
-终端图片依赖 pi / pi-tui 的 inline image 能力：Kitty、Ghostty、WezTerm 走 Kitty graphics protocol，iTerm2 走 iTerm2 image protocol；如果终端不支持或 `terminal.showImages=false`，会显示图片占位信息。
+终端图片优先使用 pi / pi-tui 的 inline image 能力：Kitty、Ghostty、WezTerm 走 Kitty graphics protocol，iTerm2 走 iTerm2 image protocol。PowerShell、cmd、zsh 是 shell，不是图片协议；在 Windows Terminal / 普通 xterm 这类未向 pi 暴露 Kitty/iTerm2 的终端里，插件会先尝试调用系统默认图片查看器打开保存后的图片，并对 PNG 自动降级为 ANSI 色块预览，同时显示图片文件路径。
 
-用户可选择：
+审查面板参考已安装的 `pi-ace-tool` 配置选择器交互：使用上下键选择、Enter 确认、Esc 取消；需要反馈时在同一个面板内显示输入框。
+
+默认选项：
 
 ```text
-1 通过，继续实现
-2 需要修改，输入反馈
-3 重做/拒绝，输入原因
-Esc 取消
+通过，继续实现
+需要修改
+重做/拒绝
+取消
 ```
+
+`需要修改` / `重做/拒绝` 会进入反馈输入框，Enter 提交，Esc 返回选项。
 
 关闭方式：
 

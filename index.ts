@@ -1,9 +1,12 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { Component, Focusable } from "@earendil-works/pi-tui";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { getCapabilities, Image, Key, matchesKey, Text } from "@earendil-works/pi-tui";
+import { getCapabilities, Image, Input, SelectList, Text, truncateToWidth, type SelectItem, type SelectListTheme } from "@earendil-works/pi-tui";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { inflateSync } from "node:zlib";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 
@@ -24,6 +27,7 @@ type ResponseFormat = "b64_json" | "url";
 type Action = "generate" | "edit";
 type ToolAction = "help" | "generate" | "edit" | "status";
 type ReviewChoice = "approve" | "revise" | "reject" | "cancel";
+type ReviewInputMode = "none" | "optional" | "required";
 
 interface ImageGenConfig {
 	baseUrl?: string;
@@ -99,6 +103,8 @@ interface ImageReviewToolDetails {
 	image?: string;
 	title?: string;
 	question?: string;
+	selectedLabel?: string;
+	previewFile?: string;
 }
 
 const IMAGE_GEN_TOOL_PARAMS = Type.Object({
@@ -117,11 +123,12 @@ const IMAGE_GEN_TOOL_PARAMS = Type.Object({
 type ImageGenToolParams = Static<typeof IMAGE_GEN_TOOL_PARAMS>;
 
 const IMAGE_REVIEW_TOOL_PARAMS = Type.Object({
-	image: Type.String({ description: "要给用户审查的图片：本地路径、data URL、base64；URL 仅展示链接。" }),
+	image: Type.String({ description: "要给用户审查的图片：本地路径、URL、data URL 或 base64。" }),
 	title: Type.Optional(Type.String({ description: "审查标题，如 前端概念图审查。" })),
 	question: Type.Optional(Type.String({ description: "要用户确认的问题。" })),
 	context: Type.Optional(Type.String({ description: "简短说明图片用途、页面位置或设计目标。" })),
-	allow_feedback: Type.Optional(Type.Boolean({ description: "是否允许用户输入文字反馈，默认 true。" })),
+	options: Type.Optional(Type.Array(Type.String(), { description: "可选自定义按钮文案，最多 4 个；默认：通过、需要修改、重做、取消。" })),
+	allow_feedback: Type.Optional(Type.Boolean({ description: "是否显示反馈输入框，默认 true。" })),
 });
 
 type ImageReviewToolParams = Static<typeof IMAGE_REVIEW_TOOL_PARAMS>;
@@ -301,25 +308,16 @@ async function executeImageReviewTool(
 			details: { choice: "cancel", image: params.image, title: params.title, question: params.question },
 		};
 	}
-	const choice = await showReviewOverlay(ctx, params, preview);
-	let feedback = "";
-	if (choice === "revise" || choice === "reject") {
-		const value = await ctx.ui.editor("请输入图片修改反馈", "");
-		feedback = value?.trim() || "";
-	} else if (params.allow_feedback !== false) {
-		const wantsFeedback = await ctx.ui.confirm("补充反馈？", "是否要补充文字反馈？");
-		if (wantsFeedback) {
-			const value = await ctx.ui.editor("补充反馈", "");
-			feedback = value?.trim() || "";
-		}
-	}
+	const review = await showReviewOverlay(ctx, params, preview);
 
 	const details: ImageReviewToolDetails = {
-		choice,
-		feedback: feedback || undefined,
+		choice: review.choice,
+		feedback: review.feedback || undefined,
 		image: params.image,
 		title: params.title,
 		question: params.question,
+		selectedLabel: review.label,
+		previewFile: preview.file,
 	};
 	const content: AgentToolResult<ImageReviewToolDetails>["content"] = [{ type: "text", text: formatReviewResult(details) }];
 	if (preview.b64 && preview.mimeType) {
@@ -497,82 +495,359 @@ interface ReviewPreview {
 	b64?: string;
 	mimeType?: string;
 	label: string;
+	file?: string;
+	ansiLines?: string[];
+	viewerMessage?: string;
 	warning?: string;
+}
+
+interface ReviewOverlayResult {
+	choice: ReviewChoice;
+	label: string;
+	feedback: string;
 }
 
 async function loadReviewPreview(input: string, cwd: string): Promise<ReviewPreview> {
 	const trimmed = input.trim();
 	if (trimmed.startsWith("data:image/")) {
 		const parsed = parseDataUrl(trimmed);
-		return withTerminalImageWarning({ b64: parsed.data, mimeType: parsed.mimeType, label: "data URL" });
+		return prepareReviewPreview(ctxOutputDir(cwd), parsed.data, parsed.mimeType, "review-image", "data URL");
 	}
 	if (/^https?:\/\//i.test(trimmed)) {
 		const response = await fetch(trimmed);
 		if (!response.ok) throw new Error(`图片下载失败：HTTP ${response.status}`);
 		const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
 		const mimeType = contentType?.startsWith("image/") ? contentType : mimeFromPath(new URL(trimmed).pathname);
-		const data = Buffer.from(await response.arrayBuffer()).toString("base64");
-		return withTerminalImageWarning({ b64: data, mimeType, label: trimmed });
+		const b64 = Buffer.from(await response.arrayBuffer()).toString("base64");
+		return prepareReviewPreview(ctxOutputDir(cwd), b64, mimeType, "review-image", trimmed);
 	}
 	if (looksLikeBase64(trimmed)) {
-		return withTerminalImageWarning({ b64: trimmed, mimeType: "image/png", label: "base64 image" });
+		return prepareReviewPreview(ctxOutputDir(cwd), trimmed, "image/png", "review-image", "base64 image");
 	}
 
 	const file = isAbsolute(trimmed) ? trimmed : resolve(cwd, trimmed);
 	const data = await readFile(file);
-	return withTerminalImageWarning({ b64: data.toString("base64"), mimeType: mimeFromPath(file), label: file });
+	return prepareReviewPreview(ctxOutputDir(cwd), data.toString("base64"), mimeFromPath(file), file, file);
+}
+
+async function prepareReviewPreview(outputDir: string, b64: string, mimeType: string, nameHint: string, label: string): Promise<ReviewPreview> {
+	await mkdir(outputDir, { recursive: true });
+	const file = resolveOutputFile(outputDir, `${basename(nameHint, extname(nameHint)) || "review-image"}-${timestamp()}.${extensionFromMime(mimeType)}`, extensionFromMime(mimeType));
+	await writeFile(file, Buffer.from(b64, "base64"));
+	const base = withTerminalImageWarning({ b64, mimeType, label, file });
+	if (getCapabilities().images) return base;
+
+	const viewerMessage = await openImageWithDefaultViewer(file);
+	const ansiLines = renderPngAsAnsiBlocks(b64, mimeType, 72, 24);
+	if (ansiLines.length > 0) {
+		return { ...base, ansiLines, viewerMessage, warning: joinMessages("当前终端不支持 Kitty/iTerm2 图片协议，已使用 ANSI 色块在终端内预览。", viewerMessage) };
+	}
+	return { ...base, viewerMessage, warning: joinMessages(base.warning, viewerMessage) };
+}
+
+function ctxOutputDir(cwd: string): string {
+	return resolveOutputDir(cwd, DEFAULT_OUTPUT_DIR);
 }
 
 function withTerminalImageWarning(preview: ReviewPreview): ReviewPreview {
 	const caps = getCapabilities();
 	if (!caps.images) {
-		return { ...preview, warning: "当前终端不支持 inline image 或已被 pi 禁用，将显示图片占位信息。" };
+		return { ...preview, warning: shellAwareImageWarning(preview.file) };
 	}
 	if (caps.images === "kitty" && preview.mimeType !== "image/png") {
-		return { ...preview, warning: "Kitty/Ghostty/WezTerm 图片协议在 pi 中优先支持 PNG；非 PNG 可能显示为占位信息。" };
+		return { ...preview, warning: "Kitty/Ghostty/WezTerm 图片协议在 pi 中优先支持 PNG；非 PNG 会尝试降级为占位或 ANSI 预览。" };
 	}
 	return preview;
 }
 
-async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolParams, preview: ReviewPreview): Promise<ReviewChoice> {
-	return ctx.ui.custom<ReviewChoice>((_tui, theme, _keybindings, done) => {
+function shellAwareImageWarning(file: string | undefined): string {
+	const shell = process.env.PSModulePath ? "PowerShell/cmd" : process.env.SHELL ? basename(process.env.SHELL) : "当前 shell";
+	const terminal = process.env.WT_SESSION ? "Windows Terminal" : process.env.TERM_PROGRAM || process.env.TERM || "当前终端";
+	return `${shell} 不是图片协议，${terminal} 未向 pi 暴露 Kitty/iTerm2 inline image；将使用 ANSI 预览或显示文件路径${file ? `：${file}` : ""}。`;
+}
+
+function joinMessages(...messages: Array<string | undefined>): string | undefined {
+	const compact = messages.filter((message): message is string => Boolean(message?.trim()));
+	return compact.length > 0 ? compact.join(" ") : undefined;
+}
+
+async function openImageWithDefaultViewer(file: string): Promise<string> {
+	const command = defaultOpenCommand(file);
+	if (!command) return `已保存图片：${file}`;
+	try {
+		const child = spawn(command.command, command.args, {
+			detached: true,
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		child.on("error", () => undefined);
+		child.unref();
+		return `已尝试用系统默认图片查看器打开：${file}`;
+	} catch (error) {
+		return `无法自动打开默认图片查看器，已保存图片：${file}（${error instanceof Error ? error.message : String(error)}）`;
+	}
+}
+
+function defaultOpenCommand(file: string): { command: string; args: string[] } | undefined {
+	if (process.platform === "win32") return { command: "cmd", args: ["/c", "start", "", file] };
+	if (process.platform === "darwin") return { command: "open", args: [file] };
+	if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return { command: "wslview", args: [file] };
+	if (process.env.XDG_CURRENT_DESKTOP || process.env.DESKTOP_SESSION || process.env.DISPLAY || process.env.WAYLAND_DISPLAY) {
+		return { command: "xdg-open", args: [file] };
+	}
+	return undefined;
+}
+
+function reviewSelectTheme(theme: ExtensionContext["ui"]["theme"]): SelectListTheme {
+	return {
+		selectedPrefix: (text) => theme.fg("accent", text),
+		selectedText: (text) => theme.fg("accent", text),
+		description: (text) => theme.fg("muted", text),
+		scrollInfo: (text) => theme.fg("dim", text),
+		noMatch: (text) => theme.fg("warning", text),
+	};
+}
+
+function reviewItems(params: ImageReviewToolParams): SelectItem[] {
+	const labels = (params.options || []).map((item) => item.trim()).filter(Boolean).slice(0, 4);
+	const defaults = ["通过，继续实现", "需要修改", "重做/拒绝", "取消"];
+	const [approve, revise, reject, cancel] = [...labels, ...defaults.slice(labels.length)];
+	return [
+		{ value: "approve", label: approve, description: "图片方向可用，继续后续前端实现。" },
+		{ value: "revise", label: revise, description: "保留方向，但需要按反馈修改。" },
+		{ value: "reject", label: reject, description: "当前方案不可用，需要重新生成。" },
+		{ value: "cancel", label: cancel, description: "暂停审查，不基于这张图片推进。" },
+	];
+}
+
+async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolParams, preview: ReviewPreview): Promise<ReviewOverlayResult> {
+	return ctx.ui.custom<ReviewOverlayResult>((tui, theme, _keybindings, done) => {
 		const title = params.title?.trim() || "前端图片审查";
 		const question = params.question?.trim() || "这个概念图/素材是否可以继续用于前端实现？";
 		const context = params.context?.trim();
-		const image = preview.b64 && preview.mimeType
+		const items = reviewItems(params);
+		const selectList = new SelectList(items, items.length, reviewSelectTheme(theme), {
+			minPrimaryColumnWidth: 16,
+			maxPrimaryColumnWidth: 32,
+		});
+		const input = new Input();
+		const allowFeedback = params.allow_feedback !== false;
+		let mode: "choice" | "feedback" = "choice";
+		let selected = items[0];
+		const image = preview.b64 && preview.mimeType && getCapabilities().images
 			? new Image(preview.b64, preview.mimeType, { fallbackColor: (text) => theme.fg("muted", text) }, { maxWidthCells: 90, maxHeightCells: 30, filename: safeBasename(preview.label) })
 			: undefined;
 
-		return {
+		selectList.onSelect = (item) => {
+			selected = item;
+			const inputMode = reviewInputMode(item.value as ReviewChoice, allowFeedback);
+			if (inputMode === "none") {
+				done({ choice: item.value as ReviewChoice, label: item.label, feedback: "" });
+				return;
+			}
+			mode = "feedback";
+			input.focused = true;
+			tui.requestRender();
+		};
+		selectList.onCancel = () => done({ choice: "cancel", label: "取消", feedback: "" });
+		input.onSubmit = (value) => done({ choice: selected.value as ReviewChoice, label: selected.label, feedback: value.trim() });
+		input.onEscape = () => {
+			mode = "choice";
+			input.focused = false;
+			tui.requestRender();
+		};
+
+		const component: Component & Focusable = {
+			focused: true,
 			render(width: number) {
 				const lines = [
 					theme.fg("accent", theme.bold(title)),
-					context ? theme.fg("muted", context) : "",
-					theme.fg("toolOutput", question),
-					preview.warning ? theme.fg("warning", preview.warning) : "",
-					preview.b64 ? "" : theme.fg("warning", `无法内联预览图片：${preview.label}`),
+					context ? theme.fg("muted", truncateToWidth(context, width, "…")) : "",
+					theme.fg("toolOutput", truncateToWidth(question, width, "…")),
+					preview.warning ? theme.fg("warning", truncateToWidth(preview.warning, width, "…")) : "",
+					preview.viewerMessage && preview.warning !== preview.viewerMessage ? theme.fg("muted", truncateToWidth(preview.viewerMessage, width, "…")) : "",
+					preview.file ? theme.fg("dim", truncateToWidth(`文件：${preview.file}`, width, "…")) : "",
 				].filter(Boolean);
 				if (image) lines.push("", ...image.render(width));
-				lines.push(
-					"",
-					theme.fg("success", "1 通过，继续实现"),
-					theme.fg("warning", "2 需要修改，输入反馈"),
-					theme.fg("error", "3 重做/拒绝，输入原因"),
-					theme.fg("dim", "Esc 取消"),
-				);
+				else if (preview.ansiLines?.length) lines.push("", ...preview.ansiLines.map((line) => truncateToWidth(line, width)));
+				else lines.push("", theme.fg("muted", preview.file ? `[Image: ${preview.mimeType || "image"} ${preview.file}]` : `[Image: ${preview.mimeType || "image"}]`));
+
+				lines.push("", theme.fg("accent", "选择结果"), ...selectList.render(width));
+				if (allowFeedback) {
+					const prompt = mode === "feedback"
+						? `反馈输入（${selected.label}）：Enter 提交 · Esc 返回选项`
+						: "需要文字反馈时，选择“需要修改/重做”；通过可直接 Enter。";
+					lines.push("", theme.fg("dim", prompt));
+					if (mode === "feedback") lines.push(...input.render(width));
+				}
+				lines.push("", theme.fg("dim", "↑↓ 切换 · Enter 选择 · Esc 取消"));
 				return lines;
 			},
 			invalidate() {
 				image?.invalidate();
+				selectList.invalidate();
+				input.invalidate();
 			},
 			handleInput(data: string) {
-				if (data === "1") done("approve");
-				else if (data === "2") done("revise");
-				else if (data === "3") done("reject");
-				else if (matchesKey(data, Key.escape)) done("cancel");
+				if (mode === "feedback") input.handleInput(data);
+				else selectList.handleInput(data);
+				tui.requestRender();
 			},
 		};
-	}, { overlay: true, overlayOptions: { width: "85%", maxHeight: "90%", margin: 2 } });
+		return component;
+	}, { overlay: true, overlayOptions: { width: "90%", maxHeight: "92%", margin: 1 } });
+}
+
+function reviewInputMode(choice: ReviewChoice, allowFeedback: boolean): ReviewInputMode {
+	if (!allowFeedback || choice === "cancel") return "none";
+	if (choice === "approve") return "none";
+	return "required";
+}
+
+function renderPngAsAnsiBlocks(b64: string, mimeType: string, maxWidth: number, maxRows: number): string[] {
+	if (mimeType !== "image/png") return [];
+	const rgba = decodePngRgba(Buffer.from(b64, "base64"));
+	if (!rgba) return [];
+	const targetWidth = Math.max(1, Math.min(maxWidth, rgba.width));
+	const targetHeight = Math.max(1, Math.min(maxRows * 2, Math.round((rgba.height / rgba.width) * targetWidth)));
+	const rows: string[] = [];
+	for (let y = 0; y < targetHeight; y += 2) {
+		let line = "";
+		for (let x = 0; x < targetWidth; x++) {
+			const top = samplePixel(rgba, x, y, targetWidth, targetHeight);
+			const bottom = samplePixel(rgba, x, y + 1, targetWidth, targetHeight);
+			line += `\x1b[38;2;${top[0]};${top[1]};${top[2]}m\x1b[48;2;${bottom[0]};${bottom[1]};${bottom[2]}m▀`;
+		}
+		rows.push(`${line}\x1b[0m`);
+	}
+	return rows;
+}
+
+function samplePixel(image: DecodedPng, x: number, y: number, targetWidth: number, targetHeight: number): [number, number, number] {
+	const sx = Math.min(image.width - 1, Math.floor((x / targetWidth) * image.width));
+	const sy = Math.min(image.height - 1, Math.floor((y / targetHeight) * image.height));
+	const offset = (sy * image.width + sx) * 4;
+	const alpha = image.data[offset + 3] / 255;
+	return [
+		Math.round(image.data[offset] * alpha + 255 * (1 - alpha)),
+		Math.round(image.data[offset + 1] * alpha + 255 * (1 - alpha)),
+		Math.round(image.data[offset + 2] * alpha + 255 * (1 - alpha)),
+	];
+}
+
+interface DecodedPng {
+	width: number;
+	height: number;
+	data: Buffer;
+}
+
+function decodePngRgba(buffer: Buffer): DecodedPng | undefined {
+	if (buffer.length < 24 || buffer.readUInt32BE(0) !== 0x89504e47 || buffer.readUInt32BE(4) !== 0x0d0a1a0a) return undefined;
+	const width = buffer.readUInt32BE(16);
+	const height = buffer.readUInt32BE(20);
+	const bitDepth = buffer[24];
+	const colorType = buffer[25];
+	if (bitDepth !== 8 || ![2, 3, 4, 6].includes(colorType)) return undefined;
+
+	const idat: Buffer[] = [];
+	let palette: Buffer | undefined;
+	let transparency: Buffer | undefined;
+	let offset = 8;
+	while (offset + 12 <= buffer.length) {
+		const length = buffer.readUInt32BE(offset);
+		const type = buffer.subarray(offset + 4, offset + 8).toString("ascii");
+		const data = buffer.subarray(offset + 8, offset + 8 + length);
+		if (type === "IDAT") idat.push(data);
+		else if (type === "PLTE") palette = Buffer.from(data);
+		else if (type === "tRNS") transparency = Buffer.from(data);
+		if (type === "IEND") break;
+		offset += 12 + length;
+	}
+	if (idat.length === 0) return undefined;
+
+	const channels = pngChannels(colorType);
+	const stride = width * channels;
+	const inflated = inflateSync(Buffer.concat(idat));
+	const raw = Buffer.alloc(width * height * channels);
+	let src = 0;
+	let dst = 0;
+	let prev = Buffer.alloc(stride);
+
+	for (let y = 0; y < height; y++) {
+		const filter = inflated[src++];
+		const row = Buffer.from(inflated.subarray(src, src + stride));
+		src += stride;
+		unfilterPngRow(row, prev, channels, filter);
+		row.copy(raw, dst);
+		prev = row;
+		dst += stride;
+	}
+
+	return { width, height, data: pngRawToRgba(raw, colorType, palette, transparency) };
+}
+
+function pngChannels(colorType: number): number {
+	if (colorType === 2) return 3;
+	if (colorType === 3) return 1;
+	if (colorType === 4) return 2;
+	return 4;
+}
+
+function pngRawToRgba(raw: Buffer, colorType: number, palette: Buffer | undefined, transparency: Buffer | undefined): Buffer {
+	const pixels = colorType === 6 ? raw.length / 4 : colorType === 2 ? raw.length / 3 : colorType === 4 ? raw.length / 2 : raw.length;
+	const rgba = Buffer.alloc(pixels * 4);
+	if (colorType === 6) {
+		raw.copy(rgba);
+		return rgba;
+	}
+	if (colorType === 2) {
+		for (let i = 0, j = 0; i < raw.length; i += 3, j += 4) {
+			rgba[j] = raw[i];
+			rgba[j + 1] = raw[i + 1];
+			rgba[j + 2] = raw[i + 2];
+			rgba[j + 3] = 255;
+		}
+		return rgba;
+	}
+	if (colorType === 4) {
+		for (let i = 0, j = 0; i < raw.length; i += 2, j += 4) {
+			rgba[j] = raw[i];
+			rgba[j + 1] = raw[i];
+			rgba[j + 2] = raw[i];
+			rgba[j + 3] = raw[i + 1];
+		}
+		return rgba;
+	}
+	for (let i = 0, j = 0; i < raw.length; i++, j += 4) {
+		const index = raw[i];
+		rgba[j] = palette?.[index * 3] ?? index;
+		rgba[j + 1] = palette?.[index * 3 + 1] ?? index;
+		rgba[j + 2] = palette?.[index * 3 + 2] ?? index;
+		rgba[j + 3] = transparency?.[index] ?? 255;
+	}
+	return rgba;
+}
+
+function unfilterPngRow(row: Buffer, prev: Buffer, channels: number, filter: number): void {
+	for (let i = 0; i < row.length; i++) {
+		const left = i >= channels ? row[i - channels] : 0;
+		const up = prev[i] || 0;
+		const upLeft = i >= channels ? prev[i - channels] || 0 : 0;
+		if (filter === 1) row[i] = (row[i] + left) & 255;
+		else if (filter === 2) row[i] = (row[i] + up) & 255;
+		else if (filter === 3) row[i] = (row[i] + Math.floor((left + up) / 2)) & 255;
+		else if (filter === 4) row[i] = (row[i] + paeth(left, up, upLeft)) & 255;
+	}
+}
+
+function paeth(a: number, b: number, c: number): number {
+	const p = a + b - c;
+	const pa = Math.abs(p - a);
+	const pb = Math.abs(p - b);
+	const pc = Math.abs(p - c);
+	if (pa <= pb && pa <= pc) return a;
+	if (pb <= pc) return b;
+	return c;
 }
 
 function formatReviewResult(details: ImageReviewToolDetails): string {
