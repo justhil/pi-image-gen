@@ -90,6 +90,7 @@ TUI 配置项：
 - 图片尺寸
 - 返回格式：`b64_json` / `url`
 - 输出目录
+- 最大并行数：控制同批 `image_gen` 工具调用最多同时请求 Image2 的数量，默认 1，范围 1-8
 - 审查工具开关
 - 连接测试
 
@@ -108,6 +109,7 @@ export IMAGE2_MODEL="gpt-image-2"
 export IMAGE2_SIZE="1024x1024"
 export IMAGE2_RESPONSE_FORMAT="b64_json"
 export IMAGE2_OUTPUT_DIR=".image-gen"
+export IMAGE2_MAX_CONCURRENCY="2"
 ```
 
 兼容短变量：
@@ -119,6 +121,7 @@ export IMAGE_MODEL="gpt-image-2"
 export IMAGE_SIZE="1024x1024"
 export IMAGE_RESPONSE_FORMAT="b64_json"
 export IMAGE_OUTPUT_DIR=".image-gen"
+export IMAGE_MAX_CONCURRENCY="2"
 ```
 
 ## 原生工具
@@ -164,6 +167,8 @@ response_format  b64_json | url
 model            可选模型覆盖
 ```
 
+并行生图：`image_gen` 支持同一轮内并发执行，实际同时请求数由 `/image-gen config -> 设置最大并行数` 或 `IMAGE2_MAX_CONCURRENCY` 控制。默认 1 保持旧行为；调高后适合一次生成多张方案图。`image_review` 仍保持串行，避免多个审查弹窗抢占 TUI。
+
 ### 用户审查工具
 
 插件还会注册：
@@ -180,9 +185,9 @@ image_review
 
 用途：需要用户确认图片时调用 `image_review`，用 TUI 审查面板展示图片并收集反馈。支持本地路径、HTTP/HTTPS URL、`data:image/...` 和裸 base64；URL 会先下载为 base64 再渲染。
 
-终端图片优先使用 pi / pi-tui 的 inline image 能力：Kitty、Ghostty、WezTerm 走 Kitty graphics protocol，iTerm2 走 iTerm2 image protocol。PowerShell、cmd、zsh 是 shell，不是图片协议；在 Windows Terminal / 普通 xterm 这类未向 pi 暴露 Kitty/iTerm2 的终端里，插件会尝试调用系统默认图片查看器打开保存后的图片，同时显示图片文件路径。
+生成结果预览优先使用 pi / pi-tui 的 inline image 能力：Kitty、Ghostty、WezTerm 走 Kitty graphics protocol，iTerm2 走 iTerm2 image protocol。`image_review` 审查面板为保证边框稳定，仅在 Kitty/Ghostty/WezTerm 协议下内嵌图片；iTerm2、Windows Terminal、普通 xterm 等场景会保存图片并尝试调用系统默认图片查看器，同时在面板内显示文件路径。PowerShell、cmd、zsh 是 shell，不是图片协议。
 
-审查面板参考 `pi-ask-user`：搜索式单选、宽屏分栏详情预览、可进入自定义反馈编辑器；使用上下键选择、输入文字过滤、Enter 确认、Esc 返回或取消。
+审查面板参考 `pi-ask-user` 真实实现：外层完整边框、内部内容按 inner width 渲染后统一加侧边框，避免 ANSI 边框切片；支持搜索式单选、宽屏分栏详情预览、可进入自定义反馈编辑器。使用上下键选择、输入文字过滤、Enter 确认、Esc 清空过滤/返回或取消。
 
 默认选项：
 

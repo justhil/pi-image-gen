@@ -3,7 +3,7 @@ import type { Component, EditorTheme, Focusable } from "@earendil-works/pi-tui";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { Editor, getCapabilities, Image, Key, matchesKey, SelectList, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type SelectItem, type SelectListTheme } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, Editor, getCapabilities, Image, Key, matchesKey, SelectList, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type SelectItem, type SelectListTheme } from "@earendil-works/pi-tui";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -16,6 +16,8 @@ const DEFAULT_MODEL = "gpt-image-2";
 const DEFAULT_SIZE = "1024x1024";
 const DEFAULT_RESPONSE_FORMAT: ResponseFormat = "b64_json";
 const DEFAULT_OUTPUT_DIR = ".image-gen";
+const DEFAULT_MAX_CONCURRENCY = 1;
+const MAX_CONFIGURABLE_CONCURRENCY = 8;
 const IMAGE2_GENERATE_PATH = "/v1/images/generations";
 const IMAGE2_EDIT_PATH = "/v1/images/edits";
 
@@ -34,6 +36,7 @@ interface ImageGenConfig {
 	size?: ImageSize;
 	responseFormat?: ResponseFormat;
 	outputDir?: string;
+	maxConcurrency?: number;
 	reviewToolEnabled?: boolean;
 }
 
@@ -44,6 +47,7 @@ interface ResolvedConfig {
 	size: string;
 	responseFormat: ResponseFormat;
 	outputDir: string;
+	maxConcurrency: number;
 	reviewToolEnabled: boolean;
 }
 
@@ -105,6 +109,7 @@ interface ImageGenToolDetails extends ImageResult {
 	size?: string;
 	responseFormat?: ResponseFormat;
 	outputDir?: string;
+	maxConcurrency?: number;
 	reviewToolEnabled?: boolean;
 }
 
@@ -146,6 +151,10 @@ type ImageReviewToolParams = Static<typeof IMAGE_REVIEW_TOOL_PARAMS>;
 
 const IMAGE_GEN_PROMPT_SNIPPET = "前端/UI设计优先考虑调用image_gen生成参考图或素材；也支持通用生图/编辑，未配置用/image-gen config。";
 const IMAGE_REVIEW_PROMPT_SNIPPET = "用image_review展示图片给用户确认并收集反馈；可在/image-gen config关闭。";
+const REVIEW_BOX_LEFT = "│ ";
+const REVIEW_BOX_RIGHT = " │";
+const REVIEW_BOX_OVERHEAD = visibleWidth(REVIEW_BOX_LEFT) + visibleWidth(REVIEW_BOX_RIGHT);
+const REVIEW_OVERLAY_MAX_HEIGHT_RATIO = 0.88;
 
 export default function imageGenExtension(pi: ExtensionAPI) {
 	pi.registerTool({
@@ -154,7 +163,6 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 		description: "Image2 图片生成/编辑工具。前端/UI 设计时优先考虑生成参考图或素材；同时支持通用文生图、图生图、改图、换背景、换风格。先用 action=help 获取完整参数说明；未配置时提示用户运行 /image-gen config。",
 		promptSnippet: IMAGE_GEN_PROMPT_SNIPPET,
 		parameters: IMAGE_GEN_TOOL_PARAMS,
-		executionMode: "sequential",
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			return executeImageGenTool(params, signal, onUpdate, ctx);
 		},
@@ -431,6 +439,7 @@ async function buildToolStatus(): Promise<string> {
 		`size: ${details.size}`,
 		`response: ${details.responseFormat}`,
 		`output: ${details.outputDir}`,
+		`max concurrency: ${details.maxConcurrency}`,
 		`image_review: ${details.reviewToolEnabled ? "on" : "off"}`,
 		details.configured ? "可直接 generate/edit。" : "未配置，请运行 /image-gen config。",
 	].join("\n");
@@ -446,6 +455,7 @@ async function buildToolStatusDetails(): Promise<ImageGenToolDetails> {
 		size: config.size,
 		responseFormat: config.responseFormat,
 		outputDir: config.outputDir,
+		maxConcurrency: config.maxConcurrency,
 		reviewToolEnabled: config.reviewToolEnabled,
 	};
 }
@@ -551,7 +561,7 @@ async function prepareReviewPreview(outputDir: string, b64: string, mimeType: st
 	const file = resolveOutputFile(outputDir, `${basename(nameHint, extname(nameHint)) || "review-image"}-${timestamp()}.${extensionFromMime(mimeType)}`, extensionFromMime(mimeType));
 	await writeFile(file, Buffer.from(b64, "base64"));
 	const base = withTerminalImageWarning({ b64, mimeType, label, file });
-	if (getCapabilities().images) return base;
+	if (getCapabilities().images === "kitty") return base;
 
 	const viewerMessage = await openImageWithDefaultViewer(file);
 	return { ...base, viewerMessage, warning: joinMessages(base.warning, viewerMessage) };
@@ -641,13 +651,34 @@ function reviewOptions(params: ImageReviewToolParams): ReviewOption[] {
 	return options;
 }
 
+function reviewSelectItem(option: ReviewOption, index: number): SelectItem {
+	return {
+		value: `${option.title} ${option.description} ${option.value} ${index}`,
+		label: option.title,
+		description: option.description,
+	};
+}
+
+function reviewPrintableInput(data: string): string | undefined {
+	const kittyPrintable = decodeKittyPrintable(data);
+	if (kittyPrintable !== undefined) return kittyPrintable;
+	const characters = [...data];
+	if (characters.length !== 1) return undefined;
+	const [character] = characters;
+	if (!character) return undefined;
+	const code = character.charCodeAt(0);
+	if (code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) return undefined;
+	return character;
+}
+
 async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolParams, preview: ReviewPreview): Promise<ReviewOverlayResult> {
 	return ctx.ui.custom<ReviewOverlayResult>((tui, theme, keybindings, done) => {
 		const title = params.title?.trim() || "图片审查";
 		const question = params.question?.trim() || "这张图片是否可用？";
 		const context = params.context?.trim();
 		const options = reviewOptions(params);
-		const selectItems: SelectItem[] = options.map((option) => ({ value: option.value, label: option.title, description: option.description }));
+		const selectItems: SelectItem[] = options.map((option, index) => reviewSelectItem(option, index));
+		const optionByItemValue = new Map(selectItems.map((item, index) => [item.value, options[index] || options[0]]));
 		const selectList = new SelectList(selectItems, Math.min(selectItems.length, 8), reviewSelectTheme(theme), {
 			minPrimaryColumnWidth: 18,
 			maxPrimaryColumnWidth: 36,
@@ -657,21 +688,34 @@ async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolP
 		let mode: "select" | "comment" = "select";
 		let selected = options[0];
 		let lastPreviewValue = selected.value;
-		const image = preview.b64 && preview.mimeType && getCapabilities().images
-			? new Image(preview.b64, preview.mimeType, { fallbackColor: (text) => theme.fg("muted", text) }, { maxWidthCells: 90, maxHeightCells: 30, filename: safeBasename(preview.label) })
-			: undefined;
+		let filter = "";
+		const imageCache = new Map<number, Image>();
+		const imageForHeight = (maxHeightCells: number): Image | undefined => {
+			if (!preview.b64 || !preview.mimeType || getCapabilities().images !== "kitty") return undefined;
+			const cached = imageCache.get(maxHeightCells);
+			if (cached) return cached;
+			const image = new Image(preview.b64, preview.mimeType, { fallbackColor: (text) => theme.fg("muted", text) }, {
+				maxWidthCells: 90,
+				maxHeightCells,
+				filename: safeBasename(preview.label),
+			});
+			imageCache.set(maxHeightCells, image);
+			return image;
+		};
 
-		selectList.onSelectionChange = (item) => {
-			const next = options.find((option) => option.value === item.value) || options[0];
+		const setSelected = (next: ReviewOption) => {
 			selected = next;
 			if (next.value !== lastPreviewValue) {
 				lastPreviewValue = next.value;
 				editor.setText(prefillReviewFeedback(next.value));
 			}
+		};
+		selectList.onSelectionChange = (item) => {
+			setSelected(optionByItemValue.get(item.value) || options[0]);
 			tui.requestRender();
 		};
 		selectList.onSelect = (item) => {
-			selected = options.find((option) => option.value === item.value) || options[0];
+			setSelected(optionByItemValue.get(item.value) || options[0]);
 			if (selected.value === "cancel") {
 				done({ choice: "cancel", label: selected.title, feedback: "" });
 				return;
@@ -690,6 +734,10 @@ async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolP
 			tui.requestRender();
 		};
 		selectList.onCancel = () => done({ choice: "cancel", label: "取消", feedback: "" });
+		const syncSelectedFromList = () => {
+			const next = selectList.getSelectedItem();
+			if (next) setSelected(optionByItemValue.get(next.value) || selected);
+		};
 		editor.onSubmit = (text) => done({
 			choice: selected.value === "freeform" ? "revise" : selected.value,
 			label: selected.title,
@@ -700,24 +748,28 @@ async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolP
 			focused: true,
 			render(width: number) {
 				const panelWidth = Math.max(40, width);
-				const lines = renderPanelBox(theme, panelWidth, "审查说明", renderReviewHeader(theme, panelWidth - 4, title, question, context, preview));
-
-				lines.push("", reviewSectionTitle(theme, "图片预览"));
-				if (image) lines.push(...image.render(panelWidth));
-				else lines.push(...renderPanelBox(theme, panelWidth, "图片文件", [theme.fg("muted", preview.file ? `已保存，外部查看器已尝试打开：${preview.file}` : `[Image: ${preview.mimeType || "image"}]`)]));
-
-				lines.push("", reviewSectionTitle(theme, mode === "select" ? "选择结果" : "填写反馈"));
-				if (mode === "select") lines.push(...renderPanelBox(theme, panelWidth, "决策", renderReviewSelectPane(theme, panelWidth - 4, selectList, selected)));
-				else {
-					lines.push(...renderPanelBox(theme, panelWidth, selected.title, [theme.fg("muted", selected.description)]));
-					lines.push(...editor.render(panelWidth));
-				}
-				const hint = mode === "select" ? "输入文字过滤 · ↑↓/Ctrl+j/k 切换 · Enter 选择 · Esc 取消" : "Enter 提交反馈 · Esc 返回选项";
-				lines.push("", ...renderPanelBox(theme, panelWidth, "快捷键", [theme.fg("dim", hint)]));
-				return lines;
+				const innerWidth = Math.max(1, panelWidth - REVIEW_BOX_OVERHEAD);
+				const maxLines = Math.max(14, Math.floor(tui.terminal.rows * REVIEW_OVERLAY_MAX_HEIGHT_RATIO));
+				const imageHeight = mode === "select" ? Math.max(5, Math.min(18, maxLines - 16)) : Math.max(3, Math.min(10, maxLines - 18));
+				const lines: string[] = [
+					...renderReviewBoxTop(theme, panelWidth, "image_review"),
+					"",
+					...renderReviewHeader(theme, innerWidth, title, question, context, preview),
+					"",
+					...renderReviewImagePane(theme, innerWidth, preview, imageForHeight(imageHeight)),
+					"",
+					...renderPanelBox(theme, innerWidth, mode === "select" ? "选择结果" : "填写反馈", mode === "select"
+						? renderReviewSelectPane(theme, innerWidth - 2, selectList, selected, filter)
+						: [theme.fg("muted", selected.description), ...editor.render(innerWidth - 2)]),
+					"",
+					...renderReviewHelp(theme, innerWidth, mode, filter),
+					"",
+					...renderReviewBoxBottom(theme, panelWidth, preview.file ? safeBasename(preview.file) : undefined),
+				];
+				return wrapReviewOuterBox(theme, panelWidth, limitReviewLines(lines, maxLines));
 			},
 			invalidate() {
-				image?.invalidate();
+				for (const image of imageCache.values()) image.invalidate();
 				selectList.invalidate();
 				editor.invalidate();
 			},
@@ -730,8 +782,33 @@ async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolP
 						return;
 					}
 					editor.handleInput(data);
+				} else if (matchesKey(data, Key.escape)) {
+					if (filter) {
+						filter = "";
+						selectList.setFilter(filter);
+						syncSelectedFromList();
+					} else {
+						selectList.onCancel?.();
+					}
+				} else if (keybindings.matches(data, "tui.select.cancel")) {
+					selectList.onCancel?.();
+				} else if (keybindings.matches(data, "tui.editor.deleteCharBackward") || matchesKey(data, Key.backspace)) {
+					filter = [...filter].slice(0, -1).join("");
+					selectList.setFilter(filter);
+					syncSelectedFromList();
+				} else if (matchesKey(data, Key.ctrl("k"))) {
+					selectList.handleInput("\x1b[A");
+				} else if (matchesKey(data, Key.ctrl("j")) && !matchesKey(data, Key.enter)) {
+					selectList.handleInput("\x1b[B");
 				} else {
-					selectList.handleInput(data);
+					const printable = reviewPrintableInput(data);
+					if (printable) {
+						filter += printable;
+						selectList.setFilter(filter);
+						syncSelectedFromList();
+					} else {
+						selectList.handleInput(data);
+					}
 				}
 				tui.requestRender();
 			},
@@ -754,41 +831,88 @@ function renderReviewHeader(theme: ExtensionContext["ui"]["theme"], width: numbe
 		preview.warning ? theme.fg("warning", truncateToWidth(preview.warning, width, "…")) : "",
 		preview.viewerMessage && preview.warning !== preview.viewerMessage ? theme.fg("muted", truncateToWidth(preview.viewerMessage, width, "…")) : "",
 		preview.file ? theme.fg("dim", truncateToWidth(`文件：${preview.file}`, width, "…")) : "",
-	].filter(Boolean);
+	].filter(Boolean).map((line) => truncateToWidth(line, width, "", true));
 }
 
-function reviewSectionTitle(theme: ExtensionContext["ui"]["theme"], title: string): string {
-	return theme.bg("toolSuccessBg", ` ${theme.fg("accent", theme.bold(title))} `);
+function renderReviewBoxTop(theme: ExtensionContext["ui"]["theme"], width: number, title: string): string[] {
+	const inner = Math.max(0, width - 2);
+	const label = ` ${title} `;
+	if (inner < visibleWidth(label) + 2) return [theme.fg("borderAccent", `╭${"─".repeat(inner)}╮`)];
+	const rest = Math.max(0, inner - visibleWidth(label) - 1);
+	return [theme.fg("borderAccent", "╭─") + theme.fg("dim", theme.bold(label)) + theme.fg("borderAccent", `${"─".repeat(rest)}╮`)];
+}
+
+function renderReviewBoxBottom(theme: ExtensionContext["ui"]["theme"], width: number, label: string | undefined): string[] {
+	const inner = Math.max(0, width - 2);
+	const tag = label ? ` ${truncateToWidth(label, Math.max(1, Math.floor(inner / 2)), "…")} ` : "";
+	if (!tag || inner < visibleWidth(tag) + 2) return [theme.fg("borderAccent", `╰${"─".repeat(inner)}╯`)];
+	const left = Math.max(0, inner - visibleWidth(tag) - 1);
+	return [theme.fg("borderAccent", `╰${"─".repeat(left)}`) + theme.fg("dim", tag) + theme.fg("borderAccent", "─╯")];
+}
+
+function wrapReviewOuterBox(theme: ExtensionContext["ui"]["theme"], width: number, lines: string[]): string[] {
+	const inner = Math.max(1, width - REVIEW_BOX_OVERHEAD);
+	return lines.map((line, index) => {
+		const wrapped = index === 0 || index === lines.length - 1
+			? truncateToWidth(line, width, "", true)
+			: `${theme.fg("borderAccent", REVIEW_BOX_LEFT)}${truncateToWidth(line, inner, "", true)}${theme.fg("borderAccent", REVIEW_BOX_RIGHT)}`;
+		return line.includes("\x1b_") || line.includes("\x1b]1337;File=") ? `${wrapped}\x1b[0m` : wrapped;
+	});
+}
+
+function limitReviewLines(lines: string[], maxLines: number): string[] {
+	if (lines.length <= maxLines) return lines;
+	if (maxLines <= 2) return lines.slice(0, maxLines);
+	return [...lines.slice(0, maxLines - 2), "…", lines[lines.length - 1] || ""];
+}
+
+function renderReviewImagePane(theme: ExtensionContext["ui"]["theme"], width: number, preview: ReviewPreview, image: Image | undefined): string[] {
+	if (!image) {
+		return renderPanelBox(theme, width, "图片预览", [theme.fg("muted", preview.viewerMessage || (preview.file ? `已保存图片：${preview.file}` : `[Image: ${preview.mimeType || "image"}]`))]);
+	}
+	return [
+		...renderPanelBox(theme, width, "图片预览", [theme.fg("dim", preview.file ? `文件：${preview.file}` : preview.mimeType || "image")]),
+		...image.render(width),
+	];
+}
+
+function renderReviewHelp(theme: ExtensionContext["ui"]["theme"], width: number, mode: "select" | "comment", filter: string): string[] {
+	const hint = mode === "select"
+		? `type 过滤${filter ? ` (${filter})` : ""} · ↑↓/Ctrl+j/k 切换 · Enter 选择 · Esc 清空/取消`
+		: "Enter 提交反馈 · Esc 返回选项";
+	return renderPanelBox(theme, width, "快捷键", [theme.fg("dim", hint)]);
 }
 
 function renderPanelBox(theme: ExtensionContext["ui"]["theme"], width: number, title: string, content: string[]): string[] {
-	const innerWidth = Math.max(20, width - 4);
-	const border = theme.fg("borderMuted", "─".repeat(innerWidth + 2));
+	const innerWidth = Math.max(12, width - 2);
 	const titleText = ` ${title} `;
-	const top = `${theme.fg("borderMuted", "╭")}${theme.fg("borderAccent", truncateToWidth(titleText, innerWidth, "…"))}${border.slice(Math.min(visibleWidth(titleText), innerWidth))}${theme.fg("borderMuted", "╮")}`;
+	const titleLabel = truncateToWidth(titleText, Math.max(1, innerWidth - 1), "…");
+	const topFill = Math.max(0, innerWidth - visibleWidth(titleLabel) - 1);
 	const body = content.length > 0 ? content : [""];
 	return [
-		top,
+		theme.fg("borderMuted", "╭─") + theme.fg("borderAccent", titleLabel) + theme.fg("borderMuted", `${"─".repeat(topFill)}╮`),
 		...body.flatMap((line) => wrapTextWithAnsi(line, innerWidth)).map((line) => renderPanelLine(theme, innerWidth, line)),
-		`${theme.fg("borderMuted", "╰")}${theme.fg("borderMuted", "─".repeat(innerWidth + 2))}${theme.fg("borderMuted", "╯")}`,
+		theme.fg("borderMuted", `╰${"─".repeat(innerWidth)}╯`),
 	];
 }
 
 function renderPanelLine(theme: ExtensionContext["ui"]["theme"], innerWidth: number, line: string): string {
-	const truncated = truncateToWidth(line, innerWidth, "…");
-	const padding = " ".repeat(Math.max(0, innerWidth - visibleWidth(truncated)));
-	return `${theme.fg("borderMuted", "│ ")}${theme.bg("toolPendingBg", `${truncated}${padding}`)}${theme.fg("borderMuted", " │")}`;
+	const fitted = truncateToWidth(line, innerWidth, "…", true);
+	const isImageEscape = line.includes("\x1b_") || line.includes("\x1b]1337;File=");
+	return `${theme.fg("borderMuted", "│")}${isImageEscape ? fitted : theme.bg("toolPendingBg", fitted)}${theme.fg("borderMuted", "│")}`;
 }
 
-function renderReviewSelectPane(theme: ExtensionContext["ui"]["theme"], width: number, selectList: SelectList, selected: ReviewOption): string[] {
-	if (width < 84) return selectList.render(width);
+function renderReviewSelectPane(theme: ExtensionContext["ui"]["theme"], width: number, selectList: SelectList, selected: ReviewOption, filter: string): string[] {
+	const filterLine = `${theme.fg("accent", "Filter:")} ${filter ? theme.fg("text", filter) : theme.fg("dim", "type to filter")}`;
+	if (width < 84) return [truncateToWidth(filterLine, width, ""), ...selectList.render(width)];
 	const leftWidth = Math.floor(width * 0.43);
 	const rightWidth = width - leftWidth - 3;
-	const left = selectList.render(leftWidth);
+	const left = [truncateToWidth(filterLine, leftWidth, ""), ...selectList.render(leftWidth)];
 	const right = [
-		theme.fg("accent", selected.title),
+		theme.fg("accent", theme.bold(selected.title)),
 		...wrapTextWithAnsi(selected.description, rightWidth).map((line) => theme.fg("muted", line)),
-	];
+		filter ? theme.fg("dim", `Filter: ${filter}`) : "",
+	].filter(Boolean);
 	const rows = Math.max(left.length, right.length);
 	const lines: string[] = [];
 	for (let i = 0; i < rows; i++) {
@@ -846,6 +970,7 @@ async function configFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promi
 			"设置尺寸",
 			"设置返回格式",
 			"设置输出目录",
+			`设置最大并行数 (${normalizeMaxConcurrency(config.maxConcurrency)})`,
 			`审查工具开关 (${(config.reviewToolEnabled ?? true) ? "on" : "off"})`,
 			"测试连接",
 		]);
@@ -903,6 +1028,12 @@ async function configFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promi
 				await saveConfig({ ...config, outputDir: value.trim() });
 				await ensureOutputDir(ctx.cwd, value.trim());
 			}
+			continue;
+		}
+
+		if (choice.startsWith("设置最大并行数")) {
+			const value = await ctx.ui.input("最大并行数", `1-${MAX_CONFIGURABLE_CONCURRENCY}，当前 ${normalizeMaxConcurrency(config.maxConcurrency)}`);
+			if (value?.trim()) await saveConfig({ ...config, maxConcurrency: normalizeMaxConcurrency(value.trim()) });
 			continue;
 		}
 
@@ -1008,15 +1139,85 @@ function showHelp(ctx: ExtensionCommandContext): void {
 	);
 }
 
+class ImageRequestLimiter {
+	private active = 0;
+	private queue: Array<{ limit: number; start: () => void; reject: (error: Error) => void; signal?: AbortSignal }> = [];
+
+	async run<T>(limit: number, signal: AbortSignal | undefined, work: () => Promise<T>): Promise<T> {
+		await this.acquire(limit, signal);
+		try {
+			return await work();
+		} finally {
+			this.active = Math.max(0, this.active - 1);
+			this.drain();
+		}
+	}
+
+	private acquire(limit: number, signal: AbortSignal | undefined): Promise<void> {
+		if (signal?.aborted) return Promise.reject(abortError());
+		if (this.active < limit && this.queue.length === 0) {
+			this.active += 1;
+			return Promise.resolve();
+		}
+		return new Promise((resolve, reject) => {
+			const waiter = {
+				limit,
+				start: () => {
+					signal?.removeEventListener("abort", onAbort);
+					this.active += 1;
+					resolve();
+				},
+				reject,
+				signal,
+			};
+			const onAbort = () => {
+				const index = this.queue.indexOf(waiter);
+				if (index >= 0) this.queue.splice(index, 1);
+				reject(abortError());
+				this.drain();
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+			this.queue.push(waiter);
+			this.drain();
+		});
+	}
+
+	private drain(): void {
+		while (this.queue.length > 0) {
+			const waiter = this.queue[0];
+			if (!waiter || this.active >= waiter.limit) return;
+			this.queue.shift();
+			if (waiter.signal?.aborted) {
+				waiter.reject(abortError());
+				continue;
+			}
+			waiter.start();
+		}
+	}
+}
+
+const imageRequestLimiter = new ImageRequestLimiter();
+
+function abortError(): Error {
+	return new Error("image_gen 已取消");
+}
+
 async function requestImage(ctx: { cwd: string }, options: ImageRequestOptions, signal?: AbortSignal): Promise<ImageResult> {
 	const config = await resolveConfig();
 	validateConfig(config);
+	let image: EditImageInput | undefined;
+	if (options.action === "edit") {
+		if (!options.image) throw new Error("图生图需要 image 输入");
+		image = await normalizeEditImageInput(options.image, ctx.cwd);
+	}
+	return imageRequestLimiter.run(config.maxConcurrency, signal, () => requestImageUnlocked(ctx, options, config, image, signal));
+}
 
+async function requestImageUnlocked(ctx: { cwd: string }, options: ImageRequestOptions, config: ResolvedConfig, image: EditImageInput | undefined, signal?: AbortSignal): Promise<ImageResult> {
 	let response: Response;
 	let text: string;
 	if (options.action === "edit") {
-		if (!options.image) throw new Error("图生图需要 image 输入");
-		const image = await normalizeEditImageInput(options.image, ctx.cwd);
+		if (!image) throw new Error("图生图需要 image 输入");
 		const editPayload = {
 			model: options.model || config.model,
 			prompt: options.prompt,
@@ -1160,8 +1361,15 @@ async function resolveConfig(): Promise<ResolvedConfig> {
 		size: process.env.IMAGE2_SIZE || process.env.IMAGE_SIZE || config.size || DEFAULT_SIZE,
 		responseFormat: normalizeResponseFormat(process.env.IMAGE2_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || config.responseFormat),
 		outputDir: process.env.IMAGE2_OUTPUT_DIR || process.env.IMAGE_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT_DIR,
+		maxConcurrency: normalizeMaxConcurrency(process.env.IMAGE2_MAX_CONCURRENCY || process.env.IMAGE_MAX_CONCURRENCY || config.maxConcurrency),
 		reviewToolEnabled: config.reviewToolEnabled ?? true,
 	};
+}
+
+function normalizeMaxConcurrency(value: unknown): number {
+	const parsed = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
+	if (!Number.isFinite(parsed)) return DEFAULT_MAX_CONCURRENCY;
+	return Math.max(1, Math.min(MAX_CONFIGURABLE_CONCURRENCY, Math.floor(parsed)));
 }
 
 function validateConfig(config: ResolvedConfig): void {
@@ -1177,6 +1385,7 @@ function normalizeResponseFormat(value: unknown): ResponseFormat {
 function formatConfig(config: ImageGenConfig): string {
 	const envBaseUrl = process.env.IMAGE2_BASE_URL || process.env.BASE_URL;
 	const envApiKey = process.env.IMAGE2_API_KEY || process.env.API_KEY;
+	const envMaxConcurrency = process.env.IMAGE2_MAX_CONCURRENCY || process.env.IMAGE_MAX_CONCURRENCY;
 	return [
 		"Image2 配置",
 		`配置文件: ${CONFIG_FILE}`,
@@ -1186,6 +1395,7 @@ function formatConfig(config: ImageGenConfig): string {
 		`Size: ${process.env.IMAGE2_SIZE || process.env.IMAGE_SIZE || config.size || DEFAULT_SIZE}`,
 		`Response: ${process.env.IMAGE2_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || config.responseFormat || DEFAULT_RESPONSE_FORMAT}`,
 		`Output: ${process.env.IMAGE2_OUTPUT_DIR || process.env.IMAGE_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT_DIR}`,
+		`Max concurrency: ${normalizeMaxConcurrency(envMaxConcurrency || config.maxConcurrency)}${envMaxConcurrency ? " (env)" : ""}`,
 		`Review tool: ${(config.reviewToolEnabled ?? true) ? "on" : "off"}`,
 	].join("\n");
 }
@@ -1338,7 +1548,14 @@ function resolveOutputFile(outputDir: string, requestedName: string | undefined,
 		const resolved = isAbsolute(safeName) ? safeName : resolve(outputDir, safeName);
 		return extname(resolved) ? resolved : `${resolved}.${fallbackExtension}`;
 	}
-	return join(outputDir, `image-${timestamp()}.${fallbackExtension}`);
+	return join(outputDir, `image-${timestamp()}-${nextOutputSequence()}.${fallbackExtension}`);
+}
+
+let outputSequence = 0;
+
+function nextOutputSequence(): string {
+	outputSequence = (outputSequence + 1) % 100000;
+	return outputSequence.toString().padStart(5, "0");
 }
 
 function timestamp(): string {
