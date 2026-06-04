@@ -8,6 +8,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { isIP } from "node:net";
 
 const EXTENSION_NAME = "image-gen";
 const CONFIG_FILE = join(getAgentDir(), "image-gen.json");
@@ -20,6 +21,8 @@ const DEFAULT_MAX_CONCURRENCY = 1;
 const MAX_CONFIGURABLE_CONCURRENCY = 8;
 const IMAGE2_GENERATE_PATH = "/v1/images/generations";
 const IMAGE2_EDIT_PATH = "/v1/images/edits";
+const IMAGE_FETCH_TIMEOUT_MS = 15_000;
+const MAX_IMAGE_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 
 const IMAGE_SIZE_VALUES = ["1024x1024", "1024x1536", "1536x1024", "auto"] as const;
 type ImageSize = (typeof IMAGE_SIZE_VALUES)[number] | string;
@@ -540,12 +543,9 @@ async function loadReviewPreview(input: string, cwd: string): Promise<ReviewPrev
 		return prepareReviewPreview(ctxOutputDir(cwd), parsed.data, parsed.mimeType, "review-image", "data URL");
 	}
 	if (/^https?:\/\//i.test(trimmed)) {
-		const response = await fetch(trimmed);
-		if (!response.ok) throw new Error(`图片下载失败：HTTP ${response.status}`);
-		const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
-		const mimeType = contentType?.startsWith("image/") ? contentType : mimeFromPath(new URL(trimmed).pathname);
-		const b64 = Buffer.from(await response.arrayBuffer()).toString("base64");
-		return prepareReviewPreview(ctxOutputDir(cwd), b64, mimeType, "review-image", trimmed);
+		const downloaded = await fetchImage(trimmed);
+		const mimeType = downloaded.mimeType || mimeFromPath(new URL(trimmed).pathname);
+		return prepareReviewPreview(ctxOutputDir(cwd), downloaded.buffer.toString("base64"), mimeType, "review-image", trimmed);
 	}
 	if (looksLikeBase64(trimmed)) {
 		return prepareReviewPreview(ctxOutputDir(cwd), trimmed, "image/png", "review-image", "base64 image");
@@ -1428,12 +1428,57 @@ function escapeMultipartName(value: string): string {
 }
 
 async function downloadImageResult(url: string): Promise<{ buffer: Buffer; mimeType: string } | undefined> {
-	const response = await fetch(url);
-	if (!response.ok) return undefined;
-	const buffer = Buffer.from(await response.arrayBuffer());
+	try {
+		const downloaded = await fetchImage(url);
+		const mimeType = detectImageMime(downloaded.buffer) || downloaded.mimeType;
+		return mimeType ? { buffer: downloaded.buffer, mimeType } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function fetchImage(url: string): Promise<{ buffer: Buffer; mimeType: string | undefined }> {
+	const parsed = validatePublicHttpUrl(url);
+	const response = await fetch(parsed, { signal: AbortSignal.timeout(IMAGE_FETCH_TIMEOUT_MS), redirect: "follow" });
+	if (!response.ok) throw new Error(`图片下载失败：HTTP ${response.status}`);
+
+	const finalUrl = new URL(response.url || parsed.href);
+	validatePublicHttpUrl(finalUrl.href);
+
+	const length = Number(response.headers.get("content-length") || "0");
+	if (length > MAX_IMAGE_DOWNLOAD_BYTES) throw new Error(`图片过大：最大支持 ${MAX_IMAGE_DOWNLOAD_BYTES} bytes`);
+
 	const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
+	const buffer = Buffer.from(await response.arrayBuffer());
+	if (buffer.length > MAX_IMAGE_DOWNLOAD_BYTES) throw new Error(`图片过大：最大支持 ${MAX_IMAGE_DOWNLOAD_BYTES} bytes`);
+
 	const mimeType = detectImageMime(buffer) || (isSupportedImageMime(contentType) ? contentType : undefined);
-	return mimeType ? { buffer, mimeType } : undefined;
+	if (!mimeType) throw new Error("下载内容不是支持的图片类型");
+	return { buffer, mimeType };
+}
+
+function validatePublicHttpUrl(value: string): URL {
+	const url = new URL(value);
+	if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("仅支持 http/https 图片 URL");
+	if (isPrivateHostname(url.hostname)) throw new Error("不允许下载 localhost 或内网地址图片");
+	return url;
+}
+
+function isPrivateHostname(hostname: string): boolean {
+	const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
+	if (host === "localhost" || host.endsWith(".localhost")) return true;
+	const ipVersion = isIP(host);
+	if (ipVersion === 4) {
+		const parts = host.split(".").map(Number);
+		return parts[0] === 10 || parts[0] === 127 || parts[0] === 0 ||
+			(parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) ||
+			(parts[0] === 192 && parts[1] === 168) ||
+			(parts[0] === 169 && parts[1] === 254);
+	}
+	if (ipVersion === 6) {
+		return host === "::1" || host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80:");
+	}
+	return false;
 }
 
 function responseOutputName(name: string): string {
@@ -1445,12 +1490,8 @@ function responseOutputName(name: string): string {
 async function normalizeEditImageInput(input: string, cwd: string): Promise<EditImageInput> {
 	const trimmed = input.trim();
 	if (/^https?:\/\//i.test(trimmed)) {
-		const response = await fetch(trimmed);
-		if (!response.ok) throw new Error(`图片下载失败：HTTP ${response.status}`);
-		const contentType = response.headers.get("content-type")?.split(";")[0]?.trim();
-		const buffer = Buffer.from(await response.arrayBuffer());
-		const mimeType = detectImageMime(buffer) || (contentType?.startsWith("image/") ? contentType : undefined);
-		return buildEditImageInput(buffer, mimeType, basename(new URL(trimmed).pathname), trimmed);
+		const downloaded = await fetchImage(trimmed);
+		return buildEditImageInput(downloaded.buffer, downloaded.mimeType, basename(new URL(trimmed).pathname), trimmed);
 	}
 	if (trimmed.startsWith("data:image/")) {
 		const parsed = parseDataUrl(trimmed);
