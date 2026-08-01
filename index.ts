@@ -1,9 +1,8 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Component, EditorTheme, Focusable } from "@earendil-works/pi-tui";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
-import { decodeKittyPrintable, Editor, getCapabilities, Image, Key, matchesKey, SelectList, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi, type SelectItem, type SelectListTheme } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, getCapabilities, Image, Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -30,7 +29,6 @@ type ImageSize = (typeof IMAGE_SIZE_VALUES)[number] | string;
 type ResponseFormat = "b64_json" | "url";
 type Action = "generate" | "edit";
 type ToolAction = "help" | "generate" | "edit" | "status";
-type ReviewChoice = "approve" | "revise" | "reject" | "cancel";
 
 interface ImageGenConfig {
 	baseUrl?: string;
@@ -40,7 +38,6 @@ interface ImageGenConfig {
 	responseFormat?: ResponseFormat;
 	outputDir?: string;
 	maxConcurrency?: number;
-	reviewToolEnabled?: boolean;
 }
 
 interface ResolvedConfig {
@@ -51,7 +48,6 @@ interface ResolvedConfig {
 	responseFormat: ResponseFormat;
 	outputDir: string;
 	maxConcurrency: number;
-	reviewToolEnabled: boolean;
 }
 
 interface ImageRequestOptions {
@@ -113,17 +109,6 @@ interface ImageGenToolDetails extends ImageResult {
 	responseFormat?: ResponseFormat;
 	outputDir?: string;
 	maxConcurrency?: number;
-	reviewToolEnabled?: boolean;
-}
-
-interface ImageReviewToolDetails {
-	choice: ReviewChoice;
-	feedback?: string;
-	image?: string;
-	title?: string;
-	question?: string;
-	selectedLabel?: string;
-	previewFile?: string;
 }
 
 const IMAGE_GEN_TOOL_PARAMS = Type.Object({
@@ -141,23 +126,7 @@ const IMAGE_GEN_TOOL_PARAMS = Type.Object({
 
 type ImageGenToolParams = Static<typeof IMAGE_GEN_TOOL_PARAMS>;
 
-const IMAGE_REVIEW_TOOL_PARAMS = Type.Object({
-	image: Type.String({ description: "要给用户审查的图片：本地路径、URL、data URL 或 base64。" }),
-	title: Type.Optional(Type.String({ description: "审查标题，如 图片审查。" })),
-	question: Type.Optional(Type.String({ description: "要用户确认的问题。" })),
-	context: Type.Optional(Type.String({ description: "简短说明图片用途、页面位置或设计目标。" })),
-	options: Type.Optional(Type.Array(Type.String(), { description: "可选自定义按钮文案，最多 4 个；默认：通过、需要修改、重做、取消。" })),
-	allow_feedback: Type.Optional(Type.Boolean({ description: "是否显示反馈输入框，默认 true。" })),
-});
-
-type ImageReviewToolParams = Static<typeof IMAGE_REVIEW_TOOL_PARAMS>;
-
 const IMAGE_GEN_PROMPT_SNIPPET = "前端/UI设计优先考虑调用image_gen生成参考图或素材；也支持通用生图/编辑，未配置用/image-gen config。";
-const IMAGE_REVIEW_PROMPT_SNIPPET = "用image_review展示图片给用户确认并收集反馈；可在/image-gen config关闭。";
-const REVIEW_BOX_LEFT = "│ ";
-const REVIEW_BOX_RIGHT = " │";
-const REVIEW_BOX_OVERHEAD = visibleWidth(REVIEW_BOX_LEFT) + visibleWidth(REVIEW_BOX_RIGHT);
-const REVIEW_OVERLAY_MAX_HEIGHT_RATIO = 0.88;
 
 export default function imageGenExtension(pi: ExtensionAPI) {
 	pi.registerTool({
@@ -179,28 +148,8 @@ export default function imageGenExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: "image_review",
-		label: "Image Review",
-		description: "用户图片审查工具。需要用户确认图片时调用此工具，用 TUI 展示图片并收集通过、修改、重做或文字反馈。可在 /image-gen config 中关闭，关闭后不再注入提示词。",
-		promptSnippet: IMAGE_REVIEW_PROMPT_SNIPPET,
-		parameters: IMAGE_REVIEW_TOOL_PARAMS,
-		executionMode: "sequential",
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return executeImageReviewTool(params, ctx);
-		},
-		renderCall(args, theme) {
-			const title = typeof args.title === "string" ? args.title : "review";
-			return new Text(theme.fg("toolTitle", theme.bold("image_review")) + " " + theme.fg("muted", title), 0, 0);
-		},
-		renderResult(result, _options, theme) {
-			const text = result.content.filter((item) => item.type === "text").map((item) => item.text).join("\n");
-			return new Text(theme.fg("toolOutput", text), 0, 0);
-		},
-	});
-
 	pi.on("session_start", async (_event, ctx) => {
-		await syncReviewToolActive(pi, ctx);
+		await syncConfig(pi, ctx);
 	});
 
 	pi.registerCommand("image-gen", {
@@ -253,36 +202,23 @@ async function handleImageGenCommand(pi: ExtensionAPI, args: string, ctx: Extens
 		"文生图",
 		"图生图 / 编辑",
 		"配置 Image2 API",
-		"审查工具开关",
 		"查看状态",
 	]);
 
 	if (choice === "文生图") await generateFlow(ctx, "");
 	if (choice === "图生图 / 编辑") await editFlow(ctx, "");
 	if (choice === "配置 Image2 API") await configFlow(pi, ctx);
-	if (choice === "审查工具开关") await reviewToolToggleFlow(pi, ctx);
 	if (choice === "查看状态") await showStatus(ctx);
 }
 
-async function syncReviewToolActive(pi: ExtensionAPI, ctx: Pick<ExtensionContext, "ui">): Promise<void> {
-	const config = await loadConfig();
-	applyReviewToolActive(pi, ctx, config.reviewToolEnabled ?? true);
+function syncConfig(pi: ExtensionAPI, ctx: Pick<ExtensionContext, "ui">): void {
+	const config = { reviewToolEnabled: true }; // dummy
+	applyConfigActive(pi, ctx, true);
 }
 
-function applyReviewToolActive(pi: ExtensionAPI, ctx: Pick<ExtensionContext, "ui">, enabled: boolean): void {
-	const active = new Set(pi.getActiveTools());
-	const hasReview = active.has("image_review");
-
-	if (enabled && !hasReview) {
-		active.add("image_review");
-		pi.setActiveTools([...active]);
-	}
-	if (!enabled && hasReview) {
-		active.delete("image_review");
-		pi.setActiveTools([...active]);
-	}
-
-	ctx.ui.setStatus("image-review", enabled ? undefined : "image_review: off");
+function applyConfigActive(pi: ExtensionAPI, ctx: Pick<ExtensionContext, "ui">, enabled: boolean): void {
+	// no review
+	ctx.ui.setStatus("image-gen", undefined);
 }
 
 function parseArgs(args: string): { action?: "generate" | "edit" | "config" | "status" | "help"; rest: string } {
@@ -300,52 +236,6 @@ function parseArgs(args: string): { action?: "generate" | "edit" | "config" | "s
 	if (["help", "-h", "--help", "帮助"].includes(normalized)) return { action: "help", rest };
 
 	return { rest: trimmed };
-}
-
-async function executeImageReviewTool(
-	params: ImageReviewToolParams,
-	ctx: ExtensionContext,
-): Promise<AgentToolResult<ImageReviewToolDetails>> {
-	const config = await loadConfig();
-	if (config.reviewToolEnabled === false) {
-		return {
-			content: [{ type: "text", text: "image_review 已关闭。需要重新启用请运行 /image-gen config。" }],
-			details: { choice: "cancel", image: params.image, title: params.title, question: params.question },
-		};
-	}
-
-	if (!ctx.hasUI) {
-		return {
-			content: [{ type: "text", text: "当前模式没有 TUI，无法进行用户图片审查。" }],
-			details: { choice: "cancel", image: params.image, title: params.title, question: params.question },
-		};
-	}
-
-	let preview: ReviewPreview;
-	try {
-		preview = await loadReviewPreview(params.image, ctx.cwd);
-	} catch (error) {
-		return {
-			content: [{ type: "text", text: `图片审查失败：${error instanceof Error ? error.message : String(error)}` }],
-			details: { choice: "cancel", image: params.image, title: params.title, question: params.question },
-		};
-	}
-	const review = await showReviewOverlay(ctx, params, preview);
-
-	const details: ImageReviewToolDetails = {
-		choice: review.choice,
-		feedback: review.feedback || undefined,
-		image: params.image,
-		title: params.title,
-		question: params.question,
-		selectedLabel: review.label,
-		previewFile: preview.file,
-	};
-	const content: AgentToolResult<ImageReviewToolDetails>["content"] = [{ type: "text", text: formatReviewResult(details) }];
-	if (preview.b64 && preview.mimeType) {
-		content.push({ type: "image", data: preview.b64, mimeType: preview.mimeType });
-	}
-	return { content, details };
 }
 
 async function executeImageGenTool(
@@ -425,8 +315,7 @@ function buildToolHelp(): string {
 		"4. 其他场景同样可用：概念图、产品图、换背景、风格变体、通用插画。",
 		"5. prompt 建议写清：主体、风格、比例/尺寸、色彩、用途、是否透明背景。",
 		"6. 可选参数：output_name、size、response_format、model。",
-		"7. 需要用户确认图片时，调用 image_review 展示并收集反馈。",
-		"8. 未配置时请让用户运行 /image-gen config，不要在工具参数里索要密钥。",
+		"7. 未配置时请让用户运行 /image-gen config，不要在工具参数里索要密钥。",
 		"支持 image：本地路径、HTTP URL、data:image/...、裸 base64。",
 		"输出：b64_json/data URL/普通图片 URL 都会保存图片；URL 响应另存 *-response.json。",
 	].join("\n");
@@ -443,7 +332,6 @@ async function buildToolStatus(): Promise<string> {
 		`response: ${details.responseFormat}`,
 		`output: ${details.outputDir}`,
 		`max concurrency: ${details.maxConcurrency}`,
-		`image_review: ${details.reviewToolEnabled ? "on" : "off"}`,
 		details.configured ? "可直接 generate/edit。" : "未配置，请运行 /image-gen config。",
 	].join("\n");
 }
@@ -459,7 +347,6 @@ async function buildToolStatusDetails(): Promise<ImageGenToolDetails> {
 		responseFormat: config.responseFormat,
 		outputDir: config.outputDir,
 		maxConcurrency: config.maxConcurrency,
-		reviewToolEnabled: config.reviewToolEnabled,
 	};
 }
 
@@ -515,426 +402,6 @@ async function editFlow(ctx: ExtensionCommandContext, initialPrompt: string): Pr
 	});
 }
 
-interface ReviewPreview {
-	b64?: string;
-	mimeType?: string;
-	label: string;
-	file?: string;
-	viewerMessage?: string;
-	warning?: string;
-}
-
-interface ReviewOverlayResult {
-	choice: ReviewChoice;
-	label: string;
-	feedback: string;
-}
-
-interface ReviewOption {
-	value: ReviewChoice | "freeform";
-	title: string;
-	description: string;
-}
-
-async function loadReviewPreview(input: string, cwd: string): Promise<ReviewPreview> {
-	const trimmed = input.trim();
-	if (trimmed.startsWith("data:image/")) {
-		const parsed = parseDataUrl(trimmed);
-		return prepareReviewPreview(ctxOutputDir(cwd), parsed.data, parsed.mimeType, "review-image", "data URL");
-	}
-	if (/^https?:\/\//i.test(trimmed)) {
-		const downloaded = await fetchImage(trimmed);
-		const mimeType = downloaded.mimeType || mimeFromPath(new URL(trimmed).pathname);
-		return prepareReviewPreview(ctxOutputDir(cwd), downloaded.buffer.toString("base64"), mimeType, "review-image", trimmed);
-	}
-	if (looksLikeBase64(trimmed)) {
-		return prepareReviewPreview(ctxOutputDir(cwd), trimmed, "image/png", "review-image", "base64 image");
-	}
-
-	const file = isAbsolute(trimmed) ? trimmed : resolve(cwd, trimmed);
-	const data = await readFile(file);
-	return prepareReviewPreview(ctxOutputDir(cwd), data.toString("base64"), mimeFromPath(file), file, file);
-}
-
-async function prepareReviewPreview(outputDir: string, b64: string, mimeType: string, nameHint: string, label: string): Promise<ReviewPreview> {
-	await mkdir(outputDir, { recursive: true });
-	const file = resolveOutputFile(outputDir, `${basename(nameHint, extname(nameHint)) || "review-image"}-${timestamp()}.${extensionFromMime(mimeType)}`, extensionFromMime(mimeType));
-	await writeFile(file, Buffer.from(b64, "base64"));
-	const base = withTerminalImageWarning({ b64, mimeType, label, file });
-	if (getCapabilities().images === "kitty") return base;
-
-	const viewerMessage = await openImageWithDefaultViewer(file);
-	return { ...base, viewerMessage, warning: joinMessages(base.warning, viewerMessage) };
-}
-
-function ctxOutputDir(cwd: string): string {
-	return resolveOutputDir(cwd, DEFAULT_OUTPUT_DIR);
-}
-
-function withTerminalImageWarning(preview: ReviewPreview): ReviewPreview {
-	const caps = getCapabilities();
-	if (!caps.images) return { ...preview, warning: shellAwareImageWarning(preview.file) };
-	if (caps.images === "kitty" && preview.mimeType !== "image/png") {
-		return { ...preview, warning: "Kitty/Ghostty/WezTerm 图片协议在 pi 中优先支持 PNG；非 PNG 可能显示为占位信息，已保存原图文件。" };
-	}
-	return preview;
-}
-
-function shellAwareImageWarning(file: string | undefined): string {
-	const shell = process.env.PSModulePath ? "PowerShell/cmd" : process.env.SHELL ? basename(process.env.SHELL) : "当前 shell";
-	const terminal = process.env.WT_SESSION ? "Windows Terminal" : process.env.TERM_PROGRAM || process.env.TERM || "当前终端";
-	return `${shell} 不是图片协议，${terminal} 未向 pi 暴露 Kitty/iTerm2 inline image；已保存图片文件${file ? `：${file}` : ""}。`;
-}
-
-function joinMessages(...messages: Array<string | undefined>): string | undefined {
-	const compact = messages.filter((message): message is string => Boolean(message?.trim()));
-	return compact.length > 0 ? compact.join(" ") : undefined;
-}
-
-async function openImageWithDefaultViewer(file: string): Promise<string> {
-	const command = defaultOpenCommand(file);
-	if (!command) return `已保存图片：${file}`;
-	try {
-		const child = spawn(command.command, command.args, {
-			detached: true,
-			stdio: "ignore",
-			windowsHide: true,
-		});
-		child.on("error", () => undefined);
-		child.unref();
-		return `已尝试用系统默认图片查看器打开：${file}`;
-	} catch (error) {
-		return `无法自动打开默认图片查看器，已保存图片：${file}（${error instanceof Error ? error.message : String(error)}）`;
-	}
-}
-
-function defaultOpenCommand(file: string): { command: string; args: string[] } | undefined {
-	if (process.platform === "win32") return { command: "cmd", args: ["/c", "start", "", file] };
-	if (process.platform === "darwin") return { command: "open", args: [file] };
-	if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return { command: "wslview", args: [file] };
-	if (process.env.XDG_CURRENT_DESKTOP || process.env.DESKTOP_SESSION || process.env.DISPLAY || process.env.WAYLAND_DISPLAY) {
-		return { command: "xdg-open", args: [file] };
-	}
-	return undefined;
-}
-
-function reviewSelectTheme(theme: ExtensionContext["ui"]["theme"]): SelectListTheme {
-	return {
-		selectedPrefix: (text) => theme.fg("accent", text),
-		selectedText: (text) => theme.fg("accent", text),
-		description: (text) => theme.fg("muted", text),
-		scrollInfo: (text) => theme.fg("dim", text),
-		noMatch: (text) => theme.fg("warning", text),
-	};
-}
-
-function reviewEditorTheme(theme: ExtensionContext["ui"]["theme"]): EditorTheme {
-	return {
-		borderColor: (text) => theme.fg("accent", text),
-		selectList: reviewSelectTheme(theme),
-	};
-}
-
-function reviewOptions(params: ImageReviewToolParams): ReviewOption[] {
-	const labels = (params.options || []).map((item) => item.trim()).filter(Boolean).slice(0, 4);
-	const defaults = ["通过", "需要修改", "重做", "取消"];
-	const [approve, revise, reject, cancel] = [...labels, ...defaults.slice(labels.length)];
-	const options: ReviewOption[] = [
-		{ value: "approve", title: approve, description: "认可这张图片。" },
-		{ value: "revise", title: revise, description: "保留方向，并填写修改反馈。" },
-		{ value: "reject", title: reject, description: "不采用这张图片，并填写原因。" },
-		{ value: "cancel", title: cancel, description: "取消本次审查。" },
-	];
-	if (params.allow_feedback !== false) {
-		options.splice(3, 0, { value: "freeform", title: "自定义反馈", description: "直接输入完整反馈。" });
-	}
-	return options;
-}
-
-function reviewSelectItem(option: ReviewOption, index: number): SelectItem {
-	return {
-		value: `${option.title} ${option.description} ${option.value} ${index}`,
-		label: option.title,
-		description: option.description,
-	};
-}
-
-function reviewPrintableInput(data: string): string | undefined {
-	const kittyPrintable = decodeKittyPrintable(data);
-	if (kittyPrintable !== undefined) return kittyPrintable;
-	const characters = [...data];
-	if (characters.length !== 1) return undefined;
-	const [character] = characters;
-	if (!character) return undefined;
-	const code = character.charCodeAt(0);
-	if (code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) return undefined;
-	return character;
-}
-
-async function showReviewOverlay(ctx: ExtensionContext, params: ImageReviewToolParams, preview: ReviewPreview): Promise<ReviewOverlayResult> {
-	return ctx.ui.custom<ReviewOverlayResult>((tui, theme, keybindings, done) => {
-		const title = params.title?.trim() || "图片审查";
-		const question = params.question?.trim() || "这张图片是否可用？";
-		const context = params.context?.trim();
-		const options = reviewOptions(params);
-		const selectItems: SelectItem[] = options.map((option, index) => reviewSelectItem(option, index));
-		const optionByItemValue = new Map(selectItems.map((item, index) => [item.value, options[index] || options[0]]));
-		const selectList = new SelectList(selectItems, Math.min(selectItems.length, 8), reviewSelectTheme(theme), {
-			minPrimaryColumnWidth: 18,
-			maxPrimaryColumnWidth: 36,
-		});
-		const editor = new Editor(tui, reviewEditorTheme(theme), { paddingX: 1, autocompleteMaxVisible: 0 });
-		const allowFeedback = params.allow_feedback !== false;
-		let mode: "select" | "comment" = "select";
-		let selected = options[0];
-		let lastPreviewValue = selected.value;
-		let filter = "";
-		const imageCache = new Map<number, Image>();
-		const imageForHeight = (maxHeightCells: number): Image | undefined => {
-			if (!preview.b64 || !preview.mimeType || getCapabilities().images !== "kitty") return undefined;
-			const cached = imageCache.get(maxHeightCells);
-			if (cached) return cached;
-			const image = new Image(preview.b64, preview.mimeType, { fallbackColor: (text) => theme.fg("muted", text) }, {
-				maxWidthCells: 90,
-				maxHeightCells,
-				filename: safeBasename(preview.label),
-			});
-			imageCache.set(maxHeightCells, image);
-			return image;
-		};
-
-		const setSelected = (next: ReviewOption) => {
-			selected = next;
-			if (next.value !== lastPreviewValue) {
-				lastPreviewValue = next.value;
-				editor.setText(prefillReviewFeedback(next.value));
-			}
-		};
-		selectList.onSelectionChange = (item) => {
-			setSelected(optionByItemValue.get(item.value) || options[0]);
-			tui.requestRender();
-		};
-		selectList.onSelect = (item) => {
-			setSelected(optionByItemValue.get(item.value) || options[0]);
-			if (selected.value === "cancel") {
-				done({ choice: "cancel", label: selected.title, feedback: "" });
-				return;
-			}
-			if (selected.value === "approve" && !editor.getText().trim()) {
-				done({ choice: "approve", label: selected.title, feedback: "" });
-				return;
-			}
-			if (!allowFeedback) {
-				done({ choice: selected.value === "freeform" ? "revise" : selected.value, label: selected.title, feedback: "" });
-				return;
-			}
-			mode = "comment";
-			editor.focused = true;
-			if (!editor.getText().trim()) editor.setText(prefillReviewFeedback(selected.value));
-			tui.requestRender();
-		};
-		selectList.onCancel = () => done({ choice: "cancel", label: "取消", feedback: "" });
-		const syncSelectedFromList = () => {
-			const next = selectList.getSelectedItem();
-			if (next) setSelected(optionByItemValue.get(next.value) || selected);
-		};
-		editor.onSubmit = (text) => done({
-			choice: selected.value === "freeform" ? "revise" : selected.value,
-			label: selected.title,
-			feedback: text.trim(),
-		});
-
-		const component: Component & Focusable = {
-			focused: true,
-			render(width: number) {
-				const panelWidth = Math.max(40, width);
-				const innerWidth = Math.max(1, panelWidth - REVIEW_BOX_OVERHEAD);
-				const maxLines = Math.max(14, Math.floor(tui.terminal.rows * REVIEW_OVERLAY_MAX_HEIGHT_RATIO));
-				const imageHeight = mode === "select" ? Math.max(5, Math.min(18, maxLines - 16)) : Math.max(3, Math.min(10, maxLines - 18));
-				const lines: string[] = [
-					...renderReviewBoxTop(theme, panelWidth, "image_review"),
-					"",
-					...renderReviewHeader(theme, innerWidth, title, question, context, preview),
-					"",
-					...renderReviewImagePane(theme, innerWidth, preview, imageForHeight(imageHeight)),
-					"",
-					...renderPanelBox(theme, innerWidth, mode === "select" ? "选择结果" : "填写反馈", mode === "select"
-						? renderReviewSelectPane(theme, innerWidth - 2, selectList, selected, filter)
-						: [theme.fg("muted", selected.description), ...editor.render(innerWidth - 2)]),
-					"",
-					...renderReviewHelp(theme, innerWidth, mode, filter),
-					"",
-					...renderReviewBoxBottom(theme, panelWidth, preview.file ? safeBasename(preview.file) : undefined),
-				];
-				return wrapReviewOuterBox(theme, panelWidth, limitReviewLines(lines, maxLines));
-			},
-			invalidate() {
-				for (const image of imageCache.values()) image.invalidate();
-				selectList.invalidate();
-				editor.invalidate();
-			},
-			handleInput(data: string) {
-				if (mode === "comment") {
-					if (matchesKey(data, Key.escape) || keybindings.matches(data, "tui.select.cancel")) {
-						mode = "select";
-						editor.focused = false;
-						tui.requestRender();
-						return;
-					}
-					editor.handleInput(data);
-				} else if (matchesKey(data, Key.escape)) {
-					if (filter) {
-						filter = "";
-						selectList.setFilter(filter);
-						syncSelectedFromList();
-					} else {
-						selectList.onCancel?.();
-					}
-				} else if (keybindings.matches(data, "tui.select.cancel")) {
-					selectList.onCancel?.();
-				} else if (keybindings.matches(data, "tui.editor.deleteCharBackward") || matchesKey(data, Key.backspace)) {
-					filter = [...filter].slice(0, -1).join("");
-					selectList.setFilter(filter);
-					syncSelectedFromList();
-				} else if (matchesKey(data, Key.ctrl("k"))) {
-					selectList.handleInput("\x1b[A");
-				} else if (matchesKey(data, Key.ctrl("j")) && !matchesKey(data, Key.enter)) {
-					selectList.handleInput("\x1b[B");
-				} else {
-					const printable = reviewPrintableInput(data);
-					if (printable) {
-						filter += printable;
-						selectList.setFilter(filter);
-						syncSelectedFromList();
-					} else {
-						selectList.handleInput(data);
-					}
-				}
-				tui.requestRender();
-			},
-		};
-		return component;
-	}, { overlay: true, overlayOptions: { width: "92%", minWidth: 40, maxHeight: "88%", margin: 1 } });
-}
-
-function prefillReviewFeedback(choice: ReviewChoice | "freeform"): string {
-	if (choice === "revise") return "需要修改：";
-	if (choice === "reject") return "需要重做：";
-	return "";
-}
-
-function renderReviewHeader(theme: ExtensionContext["ui"]["theme"], width: number, title: string, question: string, context: string | undefined, preview: ReviewPreview): string[] {
-	return [
-		theme.fg("accent", theme.bold(title)),
-		context ? theme.fg("muted", truncateToWidth(context, width, "…")) : "",
-		...wrapTextWithAnsi(question, Math.max(20, width)).map((line) => theme.fg("toolOutput", line)),
-		preview.warning ? theme.fg("warning", truncateToWidth(preview.warning, width, "…")) : "",
-		preview.viewerMessage && preview.warning !== preview.viewerMessage ? theme.fg("muted", truncateToWidth(preview.viewerMessage, width, "…")) : "",
-		preview.file ? theme.fg("dim", truncateToWidth(`文件：${preview.file}`, width, "…")) : "",
-	].filter(Boolean).map((line) => truncateToWidth(line, width, "", true));
-}
-
-function renderReviewBoxTop(theme: ExtensionContext["ui"]["theme"], width: number, title: string): string[] {
-	const inner = Math.max(0, width - 2);
-	const label = ` ${title} `;
-	if (inner < visibleWidth(label) + 2) return [theme.fg("borderAccent", `╭${"─".repeat(inner)}╮`)];
-	const rest = Math.max(0, inner - visibleWidth(label) - 1);
-	return [theme.fg("borderAccent", "╭─") + theme.fg("dim", theme.bold(label)) + theme.fg("borderAccent", `${"─".repeat(rest)}╮`)];
-}
-
-function renderReviewBoxBottom(theme: ExtensionContext["ui"]["theme"], width: number, label: string | undefined): string[] {
-	const inner = Math.max(0, width - 2);
-	const tag = label ? ` ${truncateToWidth(label, Math.max(1, Math.floor(inner / 2)), "…")} ` : "";
-	if (!tag || inner < visibleWidth(tag) + 2) return [theme.fg("borderAccent", `╰${"─".repeat(inner)}╯`)];
-	const left = Math.max(0, inner - visibleWidth(tag) - 1);
-	return [theme.fg("borderAccent", `╰${"─".repeat(left)}`) + theme.fg("dim", tag) + theme.fg("borderAccent", "─╯")];
-}
-
-function wrapReviewOuterBox(theme: ExtensionContext["ui"]["theme"], width: number, lines: string[]): string[] {
-	const inner = Math.max(1, width - REVIEW_BOX_OVERHEAD);
-	return lines.map((line, index) => {
-		const wrapped = index === 0 || index === lines.length - 1
-			? truncateToWidth(line, width, "", true)
-			: `${theme.fg("borderAccent", REVIEW_BOX_LEFT)}${truncateToWidth(line, inner, "", true)}${theme.fg("borderAccent", REVIEW_BOX_RIGHT)}`;
-		return line.includes("\x1b_") || line.includes("\x1b]1337;File=") ? `${wrapped}\x1b[0m` : wrapped;
-	});
-}
-
-function limitReviewLines(lines: string[], maxLines: number): string[] {
-	if (lines.length <= maxLines) return lines;
-	if (maxLines <= 2) return lines.slice(0, maxLines);
-	return [...lines.slice(0, maxLines - 2), "…", lines[lines.length - 1] || ""];
-}
-
-function renderReviewImagePane(theme: ExtensionContext["ui"]["theme"], width: number, preview: ReviewPreview, image: Image | undefined): string[] {
-	if (!image) {
-		return renderPanelBox(theme, width, "图片预览", [theme.fg("muted", preview.viewerMessage || (preview.file ? `已保存图片：${preview.file}` : `[Image: ${preview.mimeType || "image"}]`))]);
-	}
-	return [
-		...renderPanelBox(theme, width, "图片预览", [theme.fg("dim", preview.file ? `文件：${preview.file}` : preview.mimeType || "image")]),
-		...image.render(width),
-	];
-}
-
-function renderReviewHelp(theme: ExtensionContext["ui"]["theme"], width: number, mode: "select" | "comment", filter: string): string[] {
-	const hint = mode === "select"
-		? `type 过滤${filter ? ` (${filter})` : ""} · ↑↓/Ctrl+j/k 切换 · Enter 选择 · Esc 清空/取消`
-		: "Enter 提交反馈 · Esc 返回选项";
-	return renderPanelBox(theme, width, "快捷键", [theme.fg("dim", hint)]);
-}
-
-function renderPanelBox(theme: ExtensionContext["ui"]["theme"], width: number, title: string, content: string[]): string[] {
-	const innerWidth = Math.max(12, width - 2);
-	const titleText = ` ${title} `;
-	const titleLabel = truncateToWidth(titleText, Math.max(1, innerWidth - 1), "…");
-	const topFill = Math.max(0, innerWidth - visibleWidth(titleLabel) - 1);
-	const body = content.length > 0 ? content : [""];
-	return [
-		theme.fg("borderMuted", "╭─") + theme.fg("borderAccent", titleLabel) + theme.fg("borderMuted", `${"─".repeat(topFill)}╮`),
-		...body.flatMap((line) => wrapTextWithAnsi(line, innerWidth)).map((line) => renderPanelLine(theme, innerWidth, line)),
-		theme.fg("borderMuted", `╰${"─".repeat(innerWidth)}╯`),
-	];
-}
-
-function renderPanelLine(theme: ExtensionContext["ui"]["theme"], innerWidth: number, line: string): string {
-	const fitted = truncateToWidth(line, innerWidth, "…", true);
-	const isImageEscape = line.includes("\x1b_") || line.includes("\x1b]1337;File=");
-	return `${theme.fg("borderMuted", "│")}${isImageEscape ? fitted : theme.bg("toolPendingBg", fitted)}${theme.fg("borderMuted", "│")}`;
-}
-
-function renderReviewSelectPane(theme: ExtensionContext["ui"]["theme"], width: number, selectList: SelectList, selected: ReviewOption, filter: string): string[] {
-	const filterLine = `${theme.fg("accent", "Filter:")} ${filter ? theme.fg("text", filter) : theme.fg("dim", "type to filter")}`;
-	if (width < 84) return [truncateToWidth(filterLine, width, ""), ...selectList.render(width)];
-	const leftWidth = Math.floor(width * 0.43);
-	const rightWidth = width - leftWidth - 3;
-	const left = [truncateToWidth(filterLine, leftWidth, ""), ...selectList.render(leftWidth)];
-	const right = [
-		theme.fg("accent", theme.bold(selected.title)),
-		...wrapTextWithAnsi(selected.description, rightWidth).map((line) => theme.fg("muted", line)),
-		filter ? theme.fg("dim", `Filter: ${filter}`) : "",
-	].filter(Boolean);
-	const rows = Math.max(left.length, right.length);
-	const lines: string[] = [];
-	for (let i = 0; i < rows; i++) {
-		lines.push(`${truncateToWidth(left[i] || "", leftWidth, "", true)}${theme.fg("dim", " │ ")}${truncateToWidth(right[i] || "", rightWidth, "")}`);
-	}
-	return lines;
-}
-
-function formatReviewResult(details: ImageReviewToolDetails): string {
-	const label: Record<ReviewChoice, string> = {
-		approve: "用户通过。",
-		revise: "用户要求修改。",
-		reject: "用户要求重做。",
-		cancel: "用户取消审查。",
-	};
-	return [
-		`image_review: ${details.choice}`,
-		label[details.choice],
-		details.feedback ? `反馈：${details.feedback}` : "",
-	].filter(Boolean).join("\n");
-}
-
 function parseEditInlineArgs(value: string): { image: string; prompt: string } {
 	const trimmed = value.trim();
 	const match = trimmed.match(/^(?:--image|-i)\s+(\S+)\s+([\s\S]+)$/);
@@ -971,7 +438,6 @@ async function configFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promi
 			"设置返回格式",
 			"设置输出目录",
 			`设置最大并行数 (${normalizeMaxConcurrency(config.maxConcurrency)})`,
-			`审查工具开关 (${(config.reviewToolEnabled ?? true) ? "on" : "off"})`,
 			"测试连接",
 		]);
 
@@ -1037,11 +503,6 @@ async function configFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promi
 			continue;
 		}
 
-		if (choice.startsWith("审查工具开关")) {
-			await reviewToolToggleFlow(pi, ctx);
-			continue;
-		}
-
 		if (choice === "测试连接") {
 			await testConnection(ctx);
 		}
@@ -1101,21 +562,6 @@ async function fetchModels(config: ResolvedConfig): Promise<string[]> {
 		.sort((a, b) => a.localeCompare(b));
 	if (models.length === 0) throw new Error("/v1/models 未返回可用模型 ID");
 	return models;
-}
-
-async function reviewToolToggleFlow(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
-	const config = await loadConfig();
-	const enabled = config.reviewToolEnabled ?? true;
-	const choice = await ctx.ui.select("image_review 审查工具", [
-		enabled ? "保持开启" : "开启审查工具",
-		enabled ? "关闭审查工具" : "保持关闭",
-	]);
-	if (!choice || choice.startsWith("保持")) return;
-
-	const nextEnabled = choice.startsWith("开启");
-	await saveConfig({ ...config, reviewToolEnabled: nextEnabled });
-	applyReviewToolActive(pi, ctx, nextEnabled);
-	ctx.ui.notify(nextEnabled ? "image_review 已开启，审查工具提示词已恢复注入。" : "image_review 已关闭，审查工具提示词已停止注入。", "info");
 }
 
 async function showStatus(ctx: ExtensionCommandContext): Promise<void> {
@@ -1362,7 +808,6 @@ async function resolveConfig(): Promise<ResolvedConfig> {
 		responseFormat: normalizeResponseFormat(process.env.IMAGE2_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || config.responseFormat),
 		outputDir: process.env.IMAGE2_OUTPUT_DIR || process.env.IMAGE_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT_DIR,
 		maxConcurrency: normalizeMaxConcurrency(process.env.IMAGE2_MAX_CONCURRENCY || process.env.IMAGE_MAX_CONCURRENCY || config.maxConcurrency),
-		reviewToolEnabled: config.reviewToolEnabled ?? true,
 	};
 }
 
@@ -1396,7 +841,6 @@ function formatConfig(config: ImageGenConfig): string {
 		`Response: ${process.env.IMAGE2_RESPONSE_FORMAT || process.env.IMAGE_RESPONSE_FORMAT || config.responseFormat || DEFAULT_RESPONSE_FORMAT}`,
 		`Output: ${process.env.IMAGE2_OUTPUT_DIR || process.env.IMAGE_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT_DIR}`,
 		`Max concurrency: ${normalizeMaxConcurrency(envMaxConcurrency || config.maxConcurrency)}${envMaxConcurrency ? " (env)" : ""}`,
-		`Review tool: ${(config.reviewToolEnabled ?? true) ? "on" : "off"}`,
 	].join("\n");
 }
 
@@ -1568,11 +1012,6 @@ function extensionFromMime(mimeType: string): string {
 	return "png";
 }
 
-function safeBasename(value: string): string | undefined {
-	if (/^https?:\/\//i.test(value)) return undefined;
-	return basename(value);
-}
-
 async function ensureOutputDir(cwd: string, outputDir: string): Promise<string> {
 	const dir = resolveOutputDir(cwd, outputDir);
 	await mkdir(dir, { recursive: true });
@@ -1616,32 +1055,39 @@ function apiUrl(baseUrl: string, path: string): string {
 
 async function showResult(ctx: ExtensionCommandContext, result: ImageResult): Promise<void> {
 	ctx.ui.notify(formatSuccess(result), "info");
-	if (!ctx.hasUI || !result.b64 || !result.mimeType) return;
-
-	await ctx.ui.custom<void>((_tui, theme, _keybindings, done) => {
-		const image = new Image(result.b64!, result.mimeType!, { fallbackColor: (text) => theme.fg("muted", text) }, {
-			maxWidthCells: 80,
-			maxHeightCells: 28,
-			filename: result.file ? basename(result.file) : undefined,
-		});
-		const help = new Text(theme.fg("success", "图片已生成") + "\n" + theme.fg("dim", `${result.file || ""}\nEnter / Esc 关闭预览`), 0, 0);
-		return {
-			render(width: number) {
-				return [...image.render(width), "", ...help.render(width)];
-			},
-			invalidate() {
-				image.invalidate();
-				help.invalidate();
-			},
-			handleInput() {
-				done();
-			},
-		};
-	}, { overlay: true, overlayOptions: { width: "80%", maxHeight: "85%", margin: 2 } });
+	if (!result.file) return;
+	// non-blocking push to system viewer
+	openImageWithDefaultViewer(result.file).catch(() => {});
 }
 
 function formatSuccess(result: { file?: string; url?: string; responseFile?: string }): string {
 	if (result.file) return `✅ 图片已保存：${result.file}`;
 	if (result.url) return `✅ 图片 URL：${result.url}\n响应已保存：${result.responseFile}`;
 	return `✅ 响应已保存：${result.responseFile}`;
+}
+
+async function openImageWithDefaultViewer(file: string): Promise<void> {
+	const command = defaultOpenCommand(file);
+	if (!command) return;
+	try {
+		const child = spawn(command.command, command.args, {
+			detached: true,
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		child.on("error", () => {});
+		child.unref();
+	} catch {
+		// non-blocking, ignore
+	}
+}
+
+function defaultOpenCommand(file: string): { command: string; args: string[] } | undefined {
+	if (process.platform === "win32") return { command: "cmd", args: ["/c", "start", "", file] };
+	if (process.platform === "darwin") return { command: "open", args: [file] };
+	if (process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP) return { command: "wslview", args: [file] };
+	if (process.env.XDG_CURRENT_DESKTOP || process.env.DESKTOP_SESSION || process.env.DISPLAY || process.env.WAYLAND_DISPLAY) {
+		return { command: "xdg-open", args: [file] };
+	}
+	return undefined;
 }
