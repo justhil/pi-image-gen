@@ -126,13 +126,13 @@ const IMAGE_GEN_TOOL_PARAMS = Type.Object({
 
 type ImageGenToolParams = Static<typeof IMAGE_GEN_TOOL_PARAMS>;
 
-const IMAGE_GEN_PROMPT_SNIPPET = "前端/UI设计优先考虑调用image_gen生成参考图或素材；也支持通用生图/编辑，未配置用/image-gen config。";
+const IMAGE_GEN_PROMPT_SNIPPET = "Generate or edit an image from a text prompt and optional source image.";
 
 export default function imageGenExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "image_gen",
 		label: "Image Gen",
-		description: "Image2 图片生成/编辑工具。前端/UI 设计时优先考虑生成参考图或素材；同时支持通用文生图、图生图、改图、换背景、换风格。先用 action=help 获取完整参数说明；未配置时提示用户运行 /image-gen config。",
+		description: "Generate images from text or edit a supplied image with Image2. It supports general artwork, product and concept images, background or style changes, and visual assets or references for interface work. Use action=help for full input and output details; if unconfigured, direct the user to /image-gen config and do not request credentials through tool parameters.",
 		promptSnippet: IMAGE_GEN_PROMPT_SNIPPET,
 		parameters: IMAGE_GEN_TOOL_PARAMS,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -311,8 +311,8 @@ function buildToolHelp(): string {
 		"image_gen 使用说明：",
 		"1. 文生图：action=generate，prompt=图片描述。",
 		"2. 图生图/编辑：action=edit，image=输入图，prompt=修改要求。",
-		"3. 前端/UI 设计是高频场景：可生成页面参考图、图标、插画、商品图、空状态图、背景图。",
-		"4. 其他场景同样可用：概念图、产品图、换背景、风格变体、通用插画。",
+		"3. 可生成页面参考图、图标、插画、商品图、空状态图、背景图等视觉素材。",
+		"4. 也支持概念图、产品图、换背景、风格变体等通用场景。",
 		"5. prompt 建议写清：主体、风格、比例/尺寸、色彩、用途、是否透明背景。",
 		"6. 可选参数：output_name、size、response_format、model。",
 		"7. 未配置时请让用户运行 /image-gen config，不要在工具参数里索要密钥。",
